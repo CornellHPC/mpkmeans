@@ -78,6 +78,9 @@ extern "C" mpemuStatus_t mpemuContextReserve(mpemuContext_t ctx, size_t bytes)
 extern "C" size_t mpemuContextCapacity(mpemuContext_t ctx)
 { return ctx ? ctx->capacity : 0; }
 
+extern "C" void* mpemuContextBase(mpemuContext_t ctx)
+{ return ctx ? ctx->arena : nullptr; }
+
 extern "C" int mpemuContextAllocCount(mpemuContext_t ctx)
 { return ctx ? ctx->allocs : 0; }
 

@@ -630,6 +630,9 @@ MPEMU_API mpemuStatus_t mpemuContextDestroy(mpemuContext_t ctx);
 /* Grow the arena to at least `bytes`. No-op when it already fits. */
 MPEMU_API mpemuStatus_t mpemuContextReserve(mpemuContext_t ctx, size_t bytes);
 MPEMU_API size_t        mpemuContextCapacity(mpemuContext_t ctx);
+/* Base of the arena, for callers carving their own views. NULL before the
+ * first successful Reserve. */
+MPEMU_API void*         mpemuContextBase(mpemuContext_t ctx);
 /* Number of device allocations the context has performed, for asserting that
  * a steady-state loop is allocation-free. */
 MPEMU_API int           mpemuContextAllocCount(mpemuContext_t ctx);
@@ -777,6 +780,75 @@ MPEMU_API mpemuStatus_t mpemuGemmOzaki1Batched(cublasHandle_t handle,
                                                double beta, double* dC, int64_t ldc,
                                                const mpemuBatchWorkspace_t* bw,
                                                cudaStream_t stream);
+
+/* ==================================================================== */
+/* Concatenated-k: one GEMM per bin, no temporary, no reduction         */
+/* ==================================================================== */
+/*
+ * Every product in bin b = i+j carries the same weight, so
+ *
+ *     sum_{i=0..b} A_i B_{b-i}
+ *
+ * is a single GEMM of inner dimension (b+1)*k -- provided the planes sit
+ * contiguously along k. No temporary workspace and no reduction pass at all,
+ * which is what makes this beat the batched variant on memory-bound shapes.
+ *
+ * The LEFT operand already has the right layout: mpemuSplitBF16 writes plane i
+ * at element offset i*strideA with strideA = lda*k, so viewing dSA as an
+ * m x (nsplits*k) column-major matrix puts plane i at column block i*k.
+ *
+ * The RIGHT operand needs the planes stacked along rows and REVERSED --
+ * plane j at row block (nsplits-1-j)*k. Then bin b is exactly
+ *
+ *     op(A)[:, 0 : (b+1)k]  *  Bstack[(nsplits-1-b)*k : nsplits*k, :]
+ *
+ * because A's block i sits at inner offset i*k while B's block (b-i) sits at
+ * (nsplits-1-b+i)*k -- the two differ by the constant (nsplits-1-b)*k, so
+ * sliding B's base by that amount pairs block i with block b-i for every i at
+ * once. Verified in mpemu_test_concat.
+ *
+ * Cost: nsplits GEMMs for the full nsplits(nsplits+1)/2 products, and nsplits
+ * accumulations into C rather than one per product. Same arithmetic.
+ *
+ * The right operand is the one that changes every iteration in the target
+ * workload, and it is the small one, so re-splitting it into this layout costs
+ * no more than the ordinary split.
+ */
+
+/* Leading dimension and byte size of a stacked right-operand buffer. */
+MPEMU_API int64_t mpemuStackedLd(int64_t k, int nsplits);
+MPEMU_API size_t  mpemuStackedBytes(int64_t k, int64_t n, int nsplits, int elemBytes);
+
+/* Split the right operand directly into the stacked reversed layout. */
+MPEMU_API mpemuStatus_t mpemuSplitBF16Stacked(const float* dB, int64_t ldb,
+                                              int64_t k, int64_t n, int nsplits,
+                                              __nv_bfloat16* dS, int64_t lds,
+                                              cudaStream_t stream);
+MPEMU_API mpemuStatus_t mpemuSplitFP16Stacked(const float* dB, int64_t ldb,
+                                              int64_t k, int64_t n, int nsplits,
+                                              float scale,
+                                              __half* dS, int64_t lds,
+                                              cudaStream_t stream);
+
+/* dC := alpha * sum(products in bins [0, nbins)) + beta * dC.
+ * nbins = nsplits covers the full nsplits(nsplits+1)/2 product set; a smaller
+ * nbins is the same prefix the Range drivers would accumulate, so this still
+ * refines -- just at bin granularity rather than per product. */
+MPEMU_API mpemuStatus_t mpemuGemmEmulatedConcat(cublasHandle_t handle,
+                                                int64_t m, int64_t n, int64_t k,
+                                                float alpha,
+                                                const __nv_bfloat16* dSA, int64_t lda,
+                                                const __nv_bfloat16* dSB, int64_t ldsb,
+                                                int nsplits, int nbins,
+                                                float beta, float* dC, int64_t ldc);
+
+MPEMU_API mpemuStatus_t mpemuGemmMultiwordConcat(cublasHandle_t handle,
+                                                 int64_t m, int64_t n, int64_t k,
+                                                 float alpha, float scaleA, float scaleB,
+                                                 const __half* dSA, int64_t lda,
+                                                 const __half* dSB, int64_t ldsb,
+                                                 int nsplits, int nbins,
+                                                 float beta, float* dC, int64_t ldc);
 
 #ifdef __cplusplus
 }  /* extern "C" */

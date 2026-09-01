@@ -36,6 +36,7 @@ add_library(mpemu SHARED
     src/ozaki1_gemm.cu    # routine 2, Ozaki scheme I
     src/context.cu       # one-shot workspace arena
     src/batched.cu       # batched products + single reduction
+    src/concat.cu        # concatenated-k: one GEMM per bin, no reduction
     src/util.cu)
 add_library(mpemu::mpemu ALIAS mpemu)
 
@@ -124,6 +125,10 @@ if(MPEMU_BUILD_BENCH)
     add_executable(mpemu_test_ozaki1 bench/test_ozaki1.cu)
     target_link_libraries(mpemu_test_ozaki1 PRIVATE mpemu::mpemu CUDA::cublas CUDA::cudart)
     add_test(NAME ozaki1 COMMAND mpemu_test_ozaki1)
+
+    add_executable(mpemu_test_concat bench/test_concat.cu)
+    target_link_libraries(mpemu_test_concat PRIVATE mpemu::mpemu CUDA::cublas CUDA::cudart)
+    add_test(NAME concat COMMAND mpemu_test_concat)
 
     add_executable(mpemu_bench_oz1 bench/bench_oz1.cu)
     target_link_libraries(mpemu_bench_oz1 PRIVATE mpemu::mpemu CUDA::cublas CUDA::cudart)

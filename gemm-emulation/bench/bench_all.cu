@@ -89,6 +89,23 @@ __global__ void d2f(const double* __restrict__ s, float* __restrict__ f, long lo
 
 /* ------------------------------------------------- double-double reference */
 
+
+/* Plain half-precision baselines: cast once, then a single cublasGemmEx with
+ * FP32 accumulation. This is the "just use tensor cores and accept the
+ * accuracy" option that every emulation scheme is trying to improve on. */
+__global__ void f2bf(const float* __restrict__ s, __nv_bfloat16* __restrict__ d, long long n)
+{
+    long long i=(long long)blockIdx.x*blockDim.x+threadIdx.x;
+    long long st=(long long)gridDim.x*blockDim.x;
+    for(; i<n; i+=st) d[i]=__float2bfloat16(s[i]);
+}
+__global__ void f2h(const float* __restrict__ s, __half* __restrict__ d, long long n)
+{
+    long long i=(long long)blockIdx.x*blockDim.x+threadIdx.x;
+    long long st=(long long)gridDim.x*blockDim.x;
+    for(; i<n; i+=st) d[i]=__float2half(s[i]);
+}
+
 __device__ __forceinline__ void ddAcc(double& sh,double& sl,double p,double e)
 {
     double t=sh+p, bv=t-sh;
@@ -247,6 +264,33 @@ int main(int argc,char** argv)
         for(int i=0;i<reps;++i) CB(cublasSgemm(h,CUBLAS_OP_N,CUBLAS_OP_N,(int)m,(int)n,(int)k,&f1,dAf,(int)m,dBf,(int)k,&f0,dCf,(int)m));
         const double sms=t.stop()/reps;
         row("fp32",0,0,0.0,0.0,sms,0.0,errF(dCf));
+
+        /* ---- plain BF16 / FP16 GEMM baselines (one GEMM, no splitting) ---- */
+        {
+            __nv_bfloat16 *bA,*bB; __half *hA,*hB;
+            CK(cudaMalloc(&bA,(size_t)m*k*2)); CK(cudaMalloc(&bB,(size_t)k*n*2));
+            CK(cudaMalloc(&hA,(size_t)m*k*2)); CK(cudaMalloc(&hB,(size_t)k*n*2));
+            f2bf<<<1024,256>>>(dAf,bA,m*k); f2bf<<<1024,256>>>(dBf,bB,k*n);
+            f2h <<<1024,256>>>(dAf,hA,m*k); f2h <<<1024,256>>>(dBf,hB,k*n);
+            CK(cudaGetLastError());
+            const float one=1.0f, zero=0.0f;
+            for(int rep=0;rep<2;++rep){
+                const bool isBf = (rep==0);
+                const void* A = isBf?(const void*)bA:(const void*)hA;
+                const void* B = isBf?(const void*)bB:(const void*)hB;
+                const cudaDataType dt = isBf?CUDA_R_16BF:CUDA_R_16F;
+                for(int i=0;i<warmup;++i)
+                    cublasGemmEx_64(h,CUBLAS_OP_N,CUBLAS_OP_N,m,n,k,&one,A,dt,m,B,dt,k,
+                                    &zero,dCe,CUDA_R_32F,m,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT);
+                CK(cudaDeviceSynchronize()); t.start();
+                for(int i=0;i<reps;++i)
+                    cublasGemmEx_64(h,CUBLAS_OP_N,CUBLAS_OP_N,m,n,k,&one,A,dt,m,B,dt,k,
+                                    &zero,dCe,CUDA_R_32F,m,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT);
+                const double ms=t.stop()/reps;
+                row(isBf?"bf16gemm":"fp16gemm",0,0,0.0,0.0,ms,0.0,errF(dCe));
+            }
+            cudaFree(bA);cudaFree(bB);cudaFree(hA);cudaFree(hB);
+        }
 
         mpemuTerm_t terms[64];
 

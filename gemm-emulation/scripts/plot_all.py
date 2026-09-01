@@ -43,10 +43,15 @@ def main(paths, outdir="results/plots"):
 
     made = []
     for (dist, m, n, k), g in sorted(groups.items()):
-        base = {r["scheme"]: r for r in g if r["scheme"] in ("fp64","fp32")}
-        if len(base) < 2: continue
+        BASE = ("fp64","fp32","bf16gemm","fp16gemm")
+        base = {r["scheme"]: r for r in g if r["scheme"] in BASE}
+        if "fp64" not in base or "fp32" not in base: continue
         t64, e64 = float(base["fp64"]["ms_total"]), float(base["fp64"]["rel_err"])
         t32, e32 = float(base["fp32"]["ms_total"]), float(base["fp32"]["rel_err"])
+        plain = [(k2, lbl, c, ls) for k2, lbl, c, ls in
+                 (("bf16gemm","plain BF16 GEMM","#4C72B0","-."),
+                  ("fp16gemm","plain FP16 GEMM","#DD8452","-."))
+                 if k2 in base]
 
         data = {}
         for key,_,_ in SCHEMES:
@@ -67,6 +72,9 @@ def main(paths, outdir="results/plots"):
             a.plot(xs,ys,"o-",color=col,label=label,lw=1.8,ms=4)
         a.axhline(e64, ls="--", c="k", lw=1.3, label=f"cublasDgemm  {e64:.1e}")
         a.axhline(e32, ls=":", c="dimgray", lw=1.7, label=f"cublasSgemm  {e32:.1e}")
+        for k2,lbl,col,ls in plain:
+            ev=float(base[k2]["rel_err"])
+            a.axhline(ev, ls=ls, c=col, lw=1.3, alpha=.75, label=f"{lbl}  {ev:.1e}")
         a.set_yscale("log"); a.set_xlabel("products accumulated")
         a.set_ylabel("relative error vs double-double reference")
         a.set_title("accuracy as products are added")
@@ -102,6 +110,8 @@ def main(paths, outdir="results/plots"):
                 bottom+=vals
             a.axhline(t64,ls="--",c="k",lw=1.2,label="cublasDgemm")
             a.axhline(t32,ls=":",c="dimgray",lw=1.6,label="cublasSgemm")
+            for k2,lbl,col,ls in plain:
+                a.axhline(float(base[k2]["ms_total"]),ls=ls,c=col,lw=1.2,alpha=.75,label=lbl)
             a.set_xlabel("products accumulated"); a.set_ylabel("time (ms)")
             a.set_title(f"runtime breakdown — {label}",fontsize=9.5)
             a.grid(alpha=.3,axis="y"); a.legend(fontsize=7)

@@ -121,12 +121,9 @@ extern "C" mpemuStatus_t mpemuBatchWorkspaceInit(mpemuContext_t ctx,
     const size_t start = alignUp(arenaOffset);
     if (start + need > mpemuContextCapacity(ctx)) return MPEMU_STATUS_INVALID_VALUE;
 
-    /* mpemuContextCapacity does not expose the base pointer, so carve through
-     * a zero-size workspace view of the arena. */
-    mpemuBf16Workspace_t probe;
-    if (mpemuBf16WorkspaceInit(ctx, 0, 0, 0, 1, &probe) != MPEMU_STATUS_SUCCESS)
-        return MPEMU_STATUS_INVALID_VALUE;
-    char* base = (char*)probe.sA + start;
+    char* arena = (char*)mpemuContextBase(ctx);
+    if (!arena) return MPEMU_STATUS_INVALID_VALUE;
+    char* base = arena + start;
 
     bw->ldt      = (m + 15) / 16 * 16;
     bw->strideT  = bw->ldt * n;
