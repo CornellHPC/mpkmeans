@@ -111,9 +111,11 @@ void mpkLaunchRowNorms(const float* dC, int k, int d, float* out,
 void mpkLaunchArgminCount(const float* G, const float* cnorm2, const float* dP,
                           const float* dC, int n, int d, int k,
                           float factor, float gfac, float slack,
-                          int use_cond3, int use_cond6,
+                          int use_cond3, int use_cond6, int cascade,
                           int* jbest, float* dbest, float* gbest, float* gexact,
-                          int* row_nnz, int include_best, long long* stat_banks,
+                          int* row_nnz, int include_best,
+                          unsigned long long* ref_count,
+                          long long* stat_banks,
                           cudaStream_t s);
 
 /* CONDITION KERNEL, second half: with row_nnz scanned into row_ptr, re-apply
@@ -169,15 +171,18 @@ void mpkLaunchInertia(const float* dP, const float* dC, const int* assign,
                       int n, int d, double* out, cudaStream_t s);
 
 #ifdef MPK_STATS
-/* FP64 oracle.  For every row recompute ||p_i - c_j||^2 in FP64, then check
- *   n_excluded_best += the true argmin is neither jbest[i] nor in the CSR row
- *                      (this is a violation of Theorem 1),
- *   n_label_diff    += assign[i] is not the true argmin (also counts exact ties
- *                      and FP32 tie flips, which are harmless),
- *   excess          += D64(i, assign[i]) - D64(i, true argmin).
+/* Scores a mixed iteration against the ordinary FP32 implementation.  G32 and
+ * `ref` come from a cublasSgemm on the same centroids followed by
+ * k_row_argmin_32 -- that is, from the reference algorithm itself, not from a
+ * separate higher precision oracle.  Accumulates:
+ *   n_excluded_best += the FP32 label was neither the incumbent nor a
+ *                      survivor, i.e. a condition of Theorem 1 failed,
+ *   n_label_diff    += the FP32 label was reachable but not the one picked,
+ *   excess          += D32(i, assign[i]) - D32(i, ref[i]).
  * Counters accumulate; the caller zeroes them. */
-void mpkLaunchVerify64(const float* dP, const float* dC, const int* row_ptr,
-                       const int* col, const int* jbest, const int* assign,
-                       int n, int d, int k, long long* n_excluded_best,
-                       long long* n_label_diff, double* excess, cudaStream_t s);
+void mpkLaunchVerifyRef(const float* G32, const float* cnorm2,
+                        const int* row_ptr, const int* col, const int* jbest,
+                        const int* assign, const int* ref, int n, int k,
+                        long long* n_excluded_best, long long* n_label_diff,
+                        double* excess, cudaStream_t s);
 #endif

@@ -41,7 +41,7 @@ static void usage(const char* p) {
            "  -i <int>       max iterations             (default 50)\n"
            "  -e <int>       rng seed                   (default 1)\n"
            "  -r <int>       timed repeats, last wins   (default 1)\n"
-           "  --only <c>     run one config only: 3, 6 or 36\n"
+           "  --only <c>     run one config only: 3, 6, 36 or c (cascade)\n"
            "  --sddmm-min <n> survivors needed to use cusparseSDDMM\n"
            "                 (default: auto, from n and d)\n"
            "  --force-sddmm  always use cusparseSDDMM\n"
@@ -82,13 +82,18 @@ static double label_agreement(const std::vector<int>& a, const std::vector<int>&
 
 struct Config {
     const char* name;
-    int cond3, cond6;
+    int cond3, cond6, cascade;
 };
 
-static const Config kConfigs[3] = {
-    {"(3)",     1, 0},
-    {"(6)",     0, 1},
-    {"(3)+(6)", 1, 1},
+/* (3)->(6) is the cascade: the same exclusions as (3)+(6), but the reference
+ * entry -- and with it the FP32 read of P, which is what (6) costs -- is
+ * evaluated only for the rows (3) did not clear outright. */
+#define MPK_NCFG 4
+static const Config kConfigs[MPK_NCFG] = {
+    {"(3)",     1, 0, 0},
+    {"(6)",     0, 1, 0},
+    {"(3)+(6)", 1, 1, 0},
+    {"(3)->(6)",1, 1, 1},
 };
 
 int main(int argc, char** argv) {
@@ -118,7 +123,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "--only")) {
             const char* v = next();
             only = !strcmp(v, "3") ? 0 : !strcmp(v, "6") ? 1 :
-                   !strcmp(v, "36") ? 2 : -1;
+                   !strcmp(v, "36") ? 2 : !strcmp(v, "c") ? 3 : -1;
             if (only < 0) { usage(argv[0]); return 1; }
         }
         else if (!strcmp(a, "-v")) verbose = 1;
@@ -191,7 +196,7 @@ int main(int argc, char** argv) {
     par.sddmm_min_nnz = sddmm_min;
     par.verbose       = verbose;
 
-    mpkStats smix[3], sref;
+    mpkStats smix[MPK_NCFG], sref;
     memset(smix, 0, sizeof(smix));
     memset(&sref, 0, sizeof(sref));
 
@@ -210,7 +215,7 @@ int main(int argc, char** argv) {
     for (int r = 0; r < repeats; ++r) {
         CHK(cudaMemcpy(dCref, dC0, (size_t)k * d * sizeof(float),
                        cudaMemcpyDeviceToDevice));
-        par.verify = 0;
+        par.verify = 0;   /* the FP32 run IS the oracle; nothing to check it against */
         if (mpkMeansFP32(blas, dP, n, d, k, dCref, dAref, &par, &sref)
             != MPK_OK) { fprintf(stderr, "fp32 failed\n"); return 1; }
     }
@@ -220,11 +225,12 @@ int main(int argc, char** argv) {
                    cudaMemcpyDeviceToHost));
 
     int ok = 1;
-    std::vector<std::vector<int>> amix(3, std::vector<int>(n));
-    for (int c = 0; c < 3; ++c) {
+    std::vector<std::vector<int>> amix(MPK_NCFG, std::vector<int>(n));
+    for (int c = 0; c < MPK_NCFG; ++c) {
         if (only >= 0 && only != c) continue;
         par.use_cond3 = kConfigs[c].cond3;
         par.use_cond6 = kConfigs[c].cond6;
+        par.cascade   = kConfigs[c].cascade;
         for (int r = 0; r < repeats; ++r) {
             CHK(cudaMemcpy(dCmix, dC0, (size_t)k * d * sizeof(float),
                            cudaMemcpyDeviceToDevice));
@@ -239,7 +245,7 @@ int main(int argc, char** argv) {
                        cudaMemcpyDeviceToHost));
     }
 
-    for (int c = 0; c < 3; ++c) {
+    for (int c = 0; c < MPK_NCFG; ++c) {
         if (only >= 0 && only != c) continue;
         const mpkStats& S = smix[c];
         const double base = (double)(S.hp_baseline ? S.hp_baseline : 1);
@@ -288,7 +294,7 @@ int main(int argc, char** argv) {
            (long long)n * k);
     printf("  %-8s %6s %14s %14s %14s %11s\n",
            "cond", "iters", "reference", "survivors", "total", "ELIMINATED");
-    for (int c = 0; c < 3; ++c) {
+    for (int c = 0; c < MPK_NCFG; ++c) {
         if (only >= 0 && only != c) continue;
         const mpkStats& S = smix[c];
         const double it = (double)(S.iters ? S.iters : 1);
@@ -300,14 +306,17 @@ int main(int argc, char** argv) {
                100.0 * (1.0 - (ref + sur) / base));
     }
     printf("  reference = the incumbent's own FP32 distance, which condition (6)\n"
-           "  needs before it can exclude anything: n per iteration.  Condition\n"
-           "  (3) needs no such quantity, so it computes none; the incumbent is\n"
-           "  instead counted among the survivors, and only for the rows (3) did\n"
-           "  not clear outright.\n");
+           "  needs before it can exclude anything: n per iteration for (6) and\n"
+           "  (3)+(6).  Condition (3) needs no such quantity, so it computes\n"
+           "  none; the incumbent is instead counted among the survivors, and\n"
+           "  only for the rows (3) did not clear outright.  (3)->(6) is the\n"
+           "  cascade: (3) is applied first and a reference entry is evaluated\n"
+           "  only for the rows (3) left behind, so its reference count falls\n"
+           "  well below n while its survivor count matches (3)+(6) exactly.\n");
 
     {
         int it_min = 0, it_max = 0;
-        for (int c = 0; c < 3; ++c) {
+        for (int c = 0; c < MPK_NCFG; ++c) {
             if (only >= 0 && only != c) continue;
             const int v = smix[c].iters;
             if (!it_min || v < it_min) it_min = v;
@@ -317,7 +326,7 @@ int main(int argc, char** argv) {
             printf("\n  NOTE: the configurations converged in different numbers of\n"
                    "  iterations (%d..%d).  Per-iteration numbers are comparable;\n"
                    "  run totals are not.  Totals over the whole run:\n", it_min, it_max);
-            for (int c = 0; c < 3; ++c) {
+            for (int c = 0; c < MPK_NCFG; ++c) {
                 if (only >= 0 && only != c) continue;
                 const mpkStats& S = smix[c];
                 printf("    %-8s %d iters:  %lld of %lld\n", kConfigs[c].name,
@@ -326,11 +335,16 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (smix[0].stats_built) {
+    /* with --only, results land in smix[only]; smix[0] may never have run */
+    const int sref_idx = only >= 0 ? only : 0;
+
+    if (smix[sref_idx].stats_built) {
         printf("\nexclusion attribution, over the n*(k-1) tested pairs\n");
+        printf("  for (3)->(6), (6) is only ever evaluated on the rows (3) did\n"
+               "  not clear, so its share is over that subset, not over all n\n");
         printf("  %-8s %10s %10s %10s %10s %10s\n",
                "cond", "(3) held", "(6) held", "both", "(3) only", "(6) only");
-        for (int c = 0; c < 3; ++c) {
+        for (int c = 0; c < MPK_NCFG; ++c) {
             if (only >= 0 && only != c) continue;
             const mpkStats& S = smix[c];
             const double tb = (double)(S.tested ? S.tested : 1);
@@ -352,7 +366,7 @@ int main(int argc, char** argv) {
     printf("  %-8s %5s %7s %8s %8s %8s %7s %7s %9s %8s\n",
            "cond", "iters", "prep", "gemm", "argmin", "filter",
            "setup", "update", "assign", "TOTAL");
-    for (int c = 0; c < 3; ++c) {
+    for (int c = 0; c < MPK_NCFG; ++c) {
         if (only >= 0 && only != c) continue;
         const mpkStats& S = smix[c];
         printf("  %-8s %5d %7.2f %8.2f %8.2f %8.2f %7.2f %7.2f %9.2f %8.2f\n",
@@ -366,7 +380,7 @@ int main(int argc, char** argv) {
 
     printf("\n  %-8s %10s %10s %8s   %s\n", "cond", "ms/iter", "vs fp32",
            "update", "(centroid update, excluded above)");
-    for (int c = 0; c < 3; ++c) {
+    for (int c = 0; c < MPK_NCFG; ++c) {
         if (only >= 0 && only != c) continue;
         const mpkStats& S = smix[c];
         const double per = S.t_dist_ms / fmax(S.iters, 1);
@@ -390,11 +404,12 @@ int main(int argc, char** argv) {
      *       without the bound being wrong at all.  `excess` is what those
      *       cost: sum over disagreeing rows of D(assigned) - D(nearest). */
     printf("\nverification");
-    if (verify && smix[0].stats_built) {
-        printf("  -- FP64 oracle, recomputed for every row of every iteration\n");
+    if (verify && smix[sref_idx].stats_built) {
+        printf("  -- against a full FP32 sgemm iteration on the same centroids,\n"
+               "     every row of every iteration\n");
         printf("  %-8s %20s %22s %12s\n", "cond", "bound violations",
-               "label != true argmin", "excess");
-        for (int c = 0; c < 3; ++c) {
+               "label != fp32 label", "excess");
+        for (int c = 0; c < MPK_NCFG; ++c) {
             if (only >= 0 && only != c) continue;
             const mpkStats& S = smix[c];
             const long long rows = (long long)n * S.iters;
@@ -402,10 +417,14 @@ int main(int argc, char** argv) {
                    kConfigs[c].name, S.verify_excluded_best, rows,
                    S.verify_label_diff, rows, S.verify_excess);
         }
-        printf("  bound violations must be 0: the true nearest centroid was\n"
-               "  neither the incumbent nor among the survivors, so a condition\n"
-               "  of Theorem 1 does not hold.  label != true argmin is not a\n"
-               "  violation; excess is the total distance those rows gave up.\n");
+        printf("  the oracle is the ordinary FP32 implementation -- the same\n"
+               "  cublasSgemm and row argmin mpkMeansFP32 runs -- evaluated on\n"
+               "  the mixed run's own centroids each iteration.\n"
+               "  bound violations must be 0: the FP32 answer was neither the\n"
+               "  incumbent nor among the survivors, so a condition of Theorem 1\n"
+               "  does not hold.  label != fp32 label counts rows where the FP32\n"
+               "  answer was reachable but not chosen; excess is what that cost\n"
+               "  in the FP32 distances themselves.\n");
     } else if (verify) {
         printf("  -- SKIPPED: this binary was built without MPK_STATS, so the\n"
                "  FP64 oracle is compiled out.  Rebuild with -DMPK_STATS=ON.\n");
@@ -414,7 +433,7 @@ int main(int argc, char** argv) {
     }
 
     printf("\nclustering\n");
-    for (int c = 0; c < 3; ++c) {
+    for (int c = 0; c < MPK_NCFG; ++c) {
         if (only >= 0 && only != c) continue;
         const mpkStats& S = smix[c];
         long long identical = 0;

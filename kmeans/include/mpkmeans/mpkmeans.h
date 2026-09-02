@@ -66,6 +66,14 @@ typedef struct {
     float tol;            /* stop when max centroid movement^2 < tol; def. 0   */
     int   use_cond3;      /* default 1                                        */
     int   use_cond6;      /* default 1                                        */
+    int   cascade;        /* with both conditions on, apply (3) first and only
+                           * compute the (6) reference entry for the rows (3)
+                           * did not clear outright.  (3) needs no high
+                           * precision quantity, so a row it clears never reads
+                           * P -- and that FP32 read of P is what condition (6)
+                           * actually costs.  Exclusions are identical to the
+                           * unconditional (3)+(6); only the work differs.
+                           * Ignored unless both conditions are on.  default 0 */
     int   sddmm_min_nnz;  /* survivors needed before cusparseSDDMM is used
                            * instead of the warp kernel.  MPK_SDDMM_AUTO (the
                            * default) derives it from n and d; 0 forces SDDMM,
@@ -82,12 +90,14 @@ typedef struct {
 
     /* --- high precision distance accounting (the headline metric) ---------
      * Plain Lloyd's evaluates all n*k entries of D in high precision.  The
-     * mixed scheme evaluates n of them (one reference entry per row, what
-     * condition (6) needs) plus one per entry that survived
-     * the filter.  Everything else is decided from the FP16 GEMM alone.
-     * Summed over iterations. */
+     * mixed scheme evaluates one reference entry per row that needs one (what
+     * condition (6) needs before it can exclude anything: every row, or under
+     * the cascade only the rows (3) did not clear) plus one per entry that
+     * survived the filter.  Everything else is decided from the FP16 GEMM
+     * alone.  Summed over iterations. */
     long long hp_baseline;    /* n*k per iteration                             */
-    long long hp_reference;   /* n    per iteration -- the (6) reference entry  */
+    long long hp_reference;   /* reference entries actually evaluated: n per
+                               * iteration for (6), fewer under the cascade    */
     long long hp_update;      /* survivors refined by SDDMM or the fallback    */
 
     /* --- attribution of the exclusions, over the n*(k-1) tested pairs ------
