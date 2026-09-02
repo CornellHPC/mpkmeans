@@ -90,19 +90,24 @@ extern "C" void mpkParamsInit(mpkParams* p) {
     p->use_cond3     = 1;
     p->use_cond6     = 1;
     p->cascade       = 0;
+    p->accum         = MPK_ACCUM_FP32;
+    p->rt_theta      = 0.f;
     p->verify        = 0;
     p->verbose       = 0;
 }
 
 /* |fl(p^T c) - p^T c| <= eps * p^T c for non-negative p, c, for the FP16
- * operand / FP32 accumulate GEMM (CUBLAS_COMPUTE_32F).
+ * operand GEMM accumulating in the precision named by `accum`.
  *
- * FP16 operands rounded from FP32 contribute (1+u16)^2 per term; the length-d
- * FP32 summation contributes gamma_d = d*u32/(1-d*u32).  Since every term is
- * non-negative the per-term factors combine into a single relative bound on
- * the sum. */
-extern "C" double mpkEpsilon(int d) {
-    const double g = (double)d * U_FP32;
+ * FP16 operands rounded from FP32 contribute (1+u16)^2 per term regardless of
+ * accum -- operand precision does not change here.  The length-d summation
+ * contributes gamma_d = d*u/(1-d*u), where u is the accumulator's own unit
+ * roundoff: u32 for CUBLAS_COMPUTE_32F, u16 for CUBLAS_COMPUTE_16F.  Since
+ * every term is non-negative the per-term factors combine into a single
+ * relative bound on the sum. */
+extern "C" double mpkEpsilon(int d, int accum) {
+    const double u = (accum == MPK_ACCUM_FP16) ? U_FP16 : U_FP32;
+    const double g = (double)d * u;
     if (g >= 1.0) return -1.0;
     const double gamma = g / (1.0 - g);
     const double eps = (1.0 + U_FP16) * (1.0 + U_FP16) * (1.0 + gamma) - 1.0;
@@ -117,6 +122,18 @@ __global__ void k_add_const(float* p, long long n, float c) {
     long long stride = (long long)gridDim.x * blockDim.x;
     for (; i < n; i += stride) p[i] += c;
 }
+}
+
+/* Add a constant to every entry of a k x d centroid block.  Used to move the
+ * initial centers between the shifted and unshifted frames so that every
+ * configuration starts from the same points. */
+extern "C" mpkStatus mpkShiftCentroids(float* dC, int k, int d, float delta) {
+    const long long total = (long long)k * d;
+    long long blocks = (total + 255) / 256;
+    int grid = (int)(blocks > 8192 ? 8192 : (blocks < 1 ? 1 : blocks));
+    k_add_const<<<grid, 256>>>(dC, total, delta);
+    MPK_CUDA(cudaGetLastError());
+    return MPK_OK;
 }
 
 extern "C" mpkStatus mpkShiftNonNegative(float* dP, int n, int d, float* out_shift) {
@@ -167,6 +184,7 @@ extern "C" mpkStatus mpkMeansFP32(cublasHandle_t blas, const float* dP, int n,
     double *dInertia = nullptr;
     long long* dDiff = nullptr;
     long long* h_changed = nullptr;
+    float* h_moved = nullptr;
     mpkStatus st = MPK_OK;
 #define ALLOC(p, bytes) if (cudaMalloc((void**)&(p), (bytes)) != cudaSuccess) { st = MPK_ERR_ALLOC; goto done; }
     ALLOC(G, (size_t)n * k * sizeof(float));
@@ -179,7 +197,11 @@ extern "C" mpkStatus mpkMeansFP32(cublasHandle_t blas, const float* dP, int n,
     ALLOC(dDiff, sizeof(long long));
 #undef ALLOC
     if (cudaHostAlloc((void**)&h_changed, sizeof(long long), cudaHostAllocDefault)
-        != cudaSuccess) { st = MPK_ERR_ALLOC; goto done; }
+            != cudaSuccess ||
+        cudaHostAlloc((void**)&h_moved, (size_t)k * sizeof(float),
+                      cudaHostAllocDefault) != cudaSuccess) {
+        st = MPK_ERR_ALLOC; goto done;
+    }
     cudaMemset(prev, 0xff, (size_t)n * sizeof(int));
 
     {
@@ -221,15 +243,17 @@ extern "C" mpkStatus mpkMeansFP32(cublasHandle_t blas, const float* dP, int n,
             mpkLaunchFinalizeCentroids(sums, counts, k, d, dC, moved2, s);
             t5.stop(s, &stats->t_update_ms);
 
+            /* convergence on the centroids: max_j ||c_j - c_j_prev||_2 < tol.
+             * k_finalize leaves the squared movements in moved2, so the
+             * comparison is done on the max of those and squared once, not
+             * rooted k times. */
             if (P.tol > 0.f) {
-                float* hm = (float*)malloc((size_t)k * sizeof(float));
-                cudaMemcpyAsync(hm, moved2, (size_t)k * sizeof(float),
+                cudaMemcpyAsync(h_moved, moved2, (size_t)k * sizeof(float),
                                 cudaMemcpyDeviceToHost, s);
                 cudaStreamSynchronize(s);
                 float mx = 0.f;
-                for (int j = 0; j < k; ++j) mx = fmaxf(mx, hm[j]);
-                free(hm);
-                if (mx < P.tol) break;
+                for (int j = 0; j < k; ++j) mx = fmaxf(mx, h_moved[j]);
+                if (mx < P.tol * P.tol) break;
             }
             if (P.verbose)
                 fprintf(stderr, "[fp32] iter %3d  changed %lld\n", it, changed);
@@ -247,7 +271,7 @@ done:
     cublasSetMathMode(blas, saved);
     cudaFree(G); cudaFree(cnorm2); cudaFree(moved2); cudaFree(sums);
     cudaFree(counts); cudaFree(prev); cudaFree(dInertia); cudaFree(dDiff);
-    cudaFreeHost(h_changed);
+    cudaFreeHost(h_changed); cudaFreeHost(h_moved);
     return st;
 }
 
@@ -264,32 +288,38 @@ extern "C" mpkStatus mpkMeansMixed(cublasHandle_t blas,
 #ifdef MPK_STATS
     stats->stats_built = 1;
 #endif
-    if (!P.use_cond3 && !P.use_cond6) {
-        fprintf(stderr, "mpkMeansMixed: at least one condition must be on\n");
-        return MPK_ERR_INVALID;
-    }
+    /* use_cond3 == use_cond6 == 0 is not an error: it is the no-refinement
+     * mode, which runs no exclusion test and no FP32 recomputation at all --
+     * see k_argmin_count's REFINE parameter.  It has no correctness
+     * guarantee; it exists for comparison against the schemes that do. */
+    const int refine = (P.use_cond3 || P.use_cond6) ? 1 : 0;
 
     /* Condition (6) is the only one that needs a high precision quantity, so
      * it alone pays for it.  With (3) alone the incumbent's own high
      * precision distance is folded into the update step, and only for rows
      * that (3) did not clear outright. */
-    const int need_ref     = P.use_cond6 ? 1 : 0;
-    const int include_best = need_ref ? 0 : 1;
+    const int need_ref     = (refine && P.use_cond6) ? 1 : 0;
+    const int include_best = (refine && !need_ref) ? 1 : 0;
     /* the cascade only means anything when both conditions are on: with (6)
      * alone there is no free test to put in front of the reference entry */
-    const int cascade_on   = (P.cascade && P.use_cond3 && P.use_cond6) ? 1 : 0;
+    const int cascade_on   = (refine && P.cascade && P.use_cond3 && P.use_cond6)
+                            ? 1 : 0;
 
-    const double eps = mpkEpsilon(d);
-    if (eps < 0.0) {
+    /* factor/gfac are unused in the no-refinement mode (the kernel never
+     * reaches the test that reads them), so a degenerate error model there
+     * is not fatal -- only a refining run needs a real bound. */
+    const double eps = mpkEpsilon(d, P.accum);
+    if (refine && eps < 0.0) {
         fprintf(stderr,
                 "mpkMeansMixed: error model degenerate for d=%d (u_l*d >= 1).\n",
                 d);
         return MPK_ERR_INVALID;
     }
-    const float factor = (float)(2.0 * eps / (1.0 - eps));
+    const float factor = (eps >= 0.0) ? (float)(2.0 * eps / (1.0 - eps)) : 0.f;
     /* The reference entry is a warp-strided fma dot: no product rounding, and
      * the tree reduction is shallower than a sequential sum, so gamma_d is a
-     * safe overestimate of its error. */
+     * safe overestimate of its error.  Always FP32: the reference precision
+     * does not follow P.accum, which only names the GEMM's accumulator. */
     const double gs_raw = (double)d * U_FP32;
     const double gs = gs_raw / (1.0 - gs_raw);
     const float gfac = (float)(2.0 * gs / (1.0 - gs));
@@ -299,7 +329,14 @@ extern "C" mpkStatus mpkMeansMixed(cublasHandle_t blas,
     cublasGetStream(blas, &s);
 
     __half *P16 = nullptr, *C16 = nullptr;
-    float  *G = nullptr, *cnorm2 = nullptr, *moved2 = nullptr;
+    /* G lives in exactly one of these, chosen by P.accum: float for a
+     * CUBLAS_COMPUTE_32F GEMM, __half for CUBLAS_COMPUTE_16F -- half the
+     * distance matrix, which is the entire point of the FP16 accumulator.
+     * mpkLaunchArgminCount/mpkLaunchVerifyRef are templated on G's type and
+     * read it at its native width; nothing here widens it back to float. */
+    float  *Gf = nullptr;
+    __half *Gh = nullptr;
+    float  *cnorm2 = nullptr, *moved2 = nullptr;
     float  *dbest = nullptr, *gbest = nullptr, *gexact = nullptr;
     int    *jbest = nullptr, *prev = nullptr;
     unsigned long long *bestpack = nullptr;  /* per row (distance, index) key */
@@ -327,6 +364,7 @@ extern "C" mpkStatus mpkMeansMixed(cublasHandle_t blas,
      * copy, which serialises the host against the whole stream. */
     int*       h_nnz = nullptr;
     long long* h_changed = nullptr;
+    float* h_moved = nullptr;
 
     /* the one survivor buffer: a flat list of i*k + j */
     void*  list_buf = nullptr; size_t list_cap = 0, list_cap_entries = 0;
@@ -336,7 +374,8 @@ extern "C" mpkStatus mpkMeansMixed(cublasHandle_t blas,
 #define ALLOC(p, bytes) if (cudaMalloc((void**)&(p), (bytes)) != cudaSuccess) { st = MPK_ERR_ALLOC; goto done; }
     ALLOC(P16, (size_t)n * d * sizeof(__half));
     ALLOC(C16, (size_t)k * d * sizeof(__half));
-    ALLOC(G,   (size_t)n * k * sizeof(float));
+    if (P.accum == MPK_ACCUM_FP16) { ALLOC(Gh, (size_t)n * k * sizeof(__half)); }
+    else                           { ALLOC(Gf, (size_t)n * k * sizeof(float)); }
     ALLOC(cnorm2, (size_t)k * sizeof(float));
     ALLOC(moved2, (size_t)k * sizeof(float));
     ALLOC(dbest,  (size_t)n * sizeof(float));
@@ -365,7 +404,11 @@ extern "C" mpkStatus mpkMeansMixed(cublasHandle_t blas,
 
     if (cudaHostAlloc((void**)&h_nnz, sizeof(int), cudaHostAllocDefault) != cudaSuccess ||
         cudaHostAlloc((void**)&h_changed, sizeof(long long), cudaHostAllocDefault)
-            != cudaSuccess) { st = MPK_ERR_ALLOC; goto done; }
+            != cudaSuccess ||
+        cudaHostAlloc((void**)&h_moved, (size_t)k * sizeof(float),
+                      cudaHostAllocDefault) != cudaSuccess) {
+        st = MPK_ERR_ALLOC; goto done;
+    }
 
     /* Size the survivor list for two entries per row up front.  cudaMalloc
      * costs milliseconds, so growing it from inside a timed iteration would
@@ -387,7 +430,7 @@ extern "C" mpkStatus mpkMeansMixed(cublasHandle_t blas,
     mpkLaunchToHalf(dP, P16, (long long)n * d, s);
 
     {
-        Timer tt, t0, t1, t4, t5, t7;
+        Timer tt, t0, t1, t4, t5, t6, t7;
         tt.start(s);
         cublasSetMathMode(blas, CUBLAS_DEFAULT_MATH);
         const float f_one = 1.f, f_zero = 0.f;
@@ -400,11 +443,21 @@ extern "C" mpkStatus mpkMeansMixed(cublasHandle_t blas,
             t0.stop(s, &stats->t_prep_ms);
 
             t1.start(s);
-            const cublasStatus_t bs = cublasGemmEx(
-                blas, CUBLAS_OP_T, CUBLAS_OP_N, k, n, d,
-                &f_one, C16, CUDA_R_16F, d, P16, CUDA_R_16F, d,
-                &f_zero, G, CUDA_R_32F, k,
-                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+            cublasStatus_t bs;
+            if (P.accum == MPK_ACCUM_FP16) {
+                const __half h_one = __float2half(1.f), h_zero = __float2half(0.f);
+                bs = cublasGemmEx(
+                    blas, CUBLAS_OP_T, CUBLAS_OP_N, k, n, d,
+                    &h_one, C16, CUDA_R_16F, d, P16, CUDA_R_16F, d,
+                    &h_zero, Gh, CUDA_R_16F, k,
+                    CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT);
+            } else {
+                bs = cublasGemmEx(
+                    blas, CUBLAS_OP_T, CUBLAS_OP_N, k, n, d,
+                    &f_one, C16, CUDA_R_16F, d, P16, CUDA_R_16F, d,
+                    &f_zero, Gf, CUDA_R_32F, k,
+                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+            }
             if (bs != CUBLAS_STATUS_SUCCESS) {
                 fprintf(stderr, "cublasGemmEx failed: %d\n", (int)bs);
                 st = MPK_ERR_CUBLAS; goto done;
@@ -417,16 +470,22 @@ extern "C" mpkStatus mpkMeansMixed(cublasHandle_t blas,
              * There is no CSR and no scan; the count comes back from a device
              * counter, and if the list did not fit the buffer is grown and the
              * pass repeated, which happens once or twice per run at most. */
+            /* GT deduced from whichever of Gf/Gh is live this run, so the
+             * two accumulate precisions share this call site. */
+            auto launch_argmin = [&](auto* Gptr) {
+                mpkLaunchArgminCount(Gptr, cnorm2, dP, dC, n, d, k, factor, gfac,
+                                     SLACK, P.use_cond3, P.use_cond6, cascade_on,
+                                     refine, jbest, dbest, gbest, gexact, bestpack,
+                                     include_best, (int*)list_buf,
+                                     (int)list_cap_entries, dNnz, dRefCnt,
+                                     dStatBanks, s);
+            };
             int nnz = 0;
             for (;;) {
                 cudaMemsetAsync(dNnz, 0, sizeof(unsigned int), s);
                 t7.start(s);
-                mpkLaunchArgminCount(G, cnorm2, dP, dC, n, d, k, factor, gfac,
-                                     SLACK, P.use_cond3, P.use_cond6, cascade_on,
-                                     jbest, dbest, gbest, gexact, bestpack,
-                                     include_best, (int*)list_buf,
-                                     (int)list_cap_entries, dNnz, dRefCnt,
-                                     dStatBanks, s);
+                if (P.accum == MPK_ACCUM_FP16) launch_argmin(Gh);
+                else                           launch_argmin(Gf);
                 t7.stop(s, &stats->t_argmin_ms);
                 cudaMemcpyAsync(h_nnz, dNnz, sizeof(unsigned int),
                                 cudaMemcpyDeviceToHost, s);
@@ -480,10 +539,18 @@ extern "C" mpkStatus mpkMeansMixed(cublasHandle_t blas,
                     != CUBLAS_STATUS_SUCCESS) { st = MPK_ERR_CUBLAS; goto done; }
                 cublasSetMathMode(blas, vm);
                 mpkLaunchRowArgmin32(G32, cnorm2, n, k, dARef, s);
-                mpkLaunchVerifyRef(G, G32, cnorm2, jbest, dbest, gbest, gexact,
-                                   dAssign, dARef, n, k, factor, gfac, SLACK,
-                                   P.use_cond3, P.use_cond6,
-                                   dCnt + 1, dCnt + 2, dExcess, s);
+                /* refine == 0 ran no exclusion test, so "reachable" there
+                 * means the trivial (false, false) predicate, not condition
+                 * (6) alone -- gating both flags on refine keeps that. */
+                auto launch_verify = [&](auto* Gptr) {
+                    mpkLaunchVerifyRef(Gptr, G32, cnorm2, jbest, dbest, gbest,
+                                       gexact, dAssign, dARef, n, k, factor, gfac,
+                                       SLACK, P.use_cond3 && refine,
+                                       P.use_cond6 && refine,
+                                       dCnt + 1, dCnt + 2, dExcess, s);
+                };
+                if (P.accum == MPK_ACCUM_FP16) launch_verify(Gh);
+                else                           launch_verify(Gf);
             }
 #endif
 
@@ -508,20 +575,30 @@ extern "C" mpkStatus mpkMeansMixed(cublasHandle_t blas,
                         100.0 * nnz / ((double)n * (k - 1)));
             if (changed == 0) break;
 
-            /* ---- 7: centroid update (excluded from t_dist_ms) ------------ */
+            /* ---- 7: centroid update (excluded from t_dist_ms) ------------
+             * Identical code in every scheme, and timed in every scheme, so
+             * that the column reads as the constant it is rather than as a
+             * blank next to the FP32 run's number. */
+            t6.start(s);
             mpkLaunchZero(sums, counts, k, d, s);
             mpkLaunchAccumulate(dP, dAssign, n, d, sums, counts, s);
             mpkLaunchFinalizeCentroids(sums, counts, k, d, dC, moved2, s);
+            /* stop_sync, not stop+collect: the update is the last thing in the
+             * iteration, so nothing downstream would have forced the event to
+             * complete and cudaEventElapsedTime would read back 0. */
+            t6.stop_sync(s, &stats->t_update_ms);
 
+            /* convergence on the centroids: max_j ||c_j - c_j_prev||_2 < tol.
+             * k_finalize leaves the squared movements in moved2, so the
+             * comparison is done on the max of those and squared once, not
+             * rooted k times. */
             if (P.tol > 0.f) {
-                float* hm = (float*)malloc((size_t)k * sizeof(float));
-                cudaMemcpyAsync(hm, moved2, (size_t)k * sizeof(float),
+                cudaMemcpyAsync(h_moved, moved2, (size_t)k * sizeof(float),
                                 cudaMemcpyDeviceToHost, s);
                 cudaStreamSynchronize(s);
                 float mx = 0.f;
-                for (int j = 0; j < k; ++j) mx = fmaxf(mx, hm[j]);
-                free(hm);
-                if (mx < P.tol) break;
+                for (int j = 0; j < k; ++j) mx = fmaxf(mx, h_moved[j]);
+                if (mx < P.tol * P.tol) break;
             }
         }
         tt.stop_sync(s, &stats->t_total_ms);
@@ -566,7 +643,7 @@ extern "C" mpkStatus mpkMeansMixed(cublasHandle_t blas,
 
 done:
     cublasSetMathMode(blas, CUBLAS_DEFAULT_MATH);
-    cudaFree(P16); cudaFree(C16); cudaFree(G);
+    cudaFree(P16); cudaFree(C16); cudaFree(Gf); cudaFree(Gh);
     cudaFree(cnorm2); cudaFree(moved2); cudaFree(dbest); cudaFree(gbest);
     cudaFree(gexact); cudaFree(dRefCnt); cudaFree(jbest);
     cudaFree(bestpack); cudaFree(dNnz);
@@ -576,7 +653,7 @@ done:
     cudaFree(prev); cudaFree(sums); cudaFree(counts);
     cudaFree(dInertia); cudaFree(dCnt); cudaFree(dStatBanks);
     cudaFree(dExcess);
-    cudaFreeHost(h_nnz); cudaFreeHost(h_changed);
+    cudaFreeHost(h_nnz); cudaFreeHost(h_changed); cudaFreeHost(h_moved);
     cudaFree(list_buf);
     return st;
 }

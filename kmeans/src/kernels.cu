@@ -184,9 +184,26 @@ __device__ __forceinline__ RowTest row_test(int jb, float db, float gb, float ge
  * gexact[i] = fl32(<p_i, c_jbest[i]>), as a warp-strided fma dot in registers.
  * Materialising the elementwise product and reducing it with a cublasSgemv
  * instead is an n x d write plus an n x d read to produce n numbers; it cost
- * 175 us/iteration at n=200k, d=128 against 35 us for the fused dot. */
-template <int IPT, bool REF, bool C3, bool C6, bool CASCADE>
-__global__ void k_argmin_count(const float* __restrict__ G,
+ * 175 us/iteration at n=200k, d=128 against 35 us for the fused dot.
+ *
+ * GT is the storage type of G: float for an FP32-accumulate GEMM, __half for
+ * an FP16-accumulate one.  The point of the FP16-accumulate path is a distance
+ * matrix half the size, so G is read at its native width and widened to float
+ * only in the register that holds it -- g_load() below -- never by a separate
+ * conversion pass over the whole matrix.
+ *
+ * REFINE is the other axis: false means no exclusion test and no FP32
+ * refinement at all -- the row argmin of the low precision G is trusted
+ * outright and packed as the final answer.  That is a structurally different
+ * kernel body (it returns right after step 1), not C3=C6=false, which still
+ * runs the exclusion test and would flag every column a survivor. */
+__device__ __forceinline__ float g_load(const float* g, int j) { return g[j]; }
+__device__ __forceinline__ float g_load(const __half* g, int j) {
+    return __half2float(g[j]);
+}
+
+template <typename GT, int IPT, bool REF, bool C3, bool C6, bool CASCADE, bool REFINE>
+__global__ void k_argmin_count(const GT* __restrict__ G,
                                const float* __restrict__ cnorm2,
                                const float* __restrict__ P,
                                const float* __restrict__ C,
@@ -237,7 +254,7 @@ __global__ void k_argmin_count(const float* __restrict__ G,
     /* every lane of a warp shares i, so the warp iterates as a whole and the
      * full-mask intrinsics below stay well defined */
     for (int i = blockIdx.x * WPB + w; i < n; i += step) {
-        const float* g = G + (size_t)i * k;
+        const GT* g = G + (size_t)i * k;
 
         /* ---- 1. row argmin of Dt(i,:) = cnorm2[:] - 2*G(i,:) ------------- */
         float gv[NREG];
@@ -246,19 +263,34 @@ __global__ void k_argmin_count(const float* __restrict__ G,
 #pragma unroll
             for (int t = 0; t < IPT; ++t) {
                 const int j = lane + t * WARP;
-                gv[t] = (j < k) ? g[j] : 0.f;
+                gv[t] = (j < k) ? g_load(g, j) : 0.f;
                 if (j < k)
                     mine = cub::ArgMin()(mine, KV{j, fmaf(-2.f, gv[t], cn[t])});
             }
         } else {
             for (int j = lane; j < k; j += WARP)
-                mine = cub::ArgMin()(mine, KV{j, fmaf(-2.f, g[j], cnorm2[j])});
+                mine = cub::ArgMin()(mine, KV{j, fmaf(-2.f, g_load(g, j), cnorm2[j])});
         }
         const KV r = WarpReduce(red[w]).Reduce(mine, cub::ArgMin());
 
         const int   jb = __shfl_sync(FULL, r.key, 0);
         const float db = __shfl_sync(FULL, r.value, 0);
-        const float gb = g[jb];          /* uniform address, hits L1 */
+        const float gb = g_load(g, jb);  /* uniform address, hits L1 */
+
+        /* ---- 0. no refinement at all: the low precision argmin is the
+         * final answer, packed straight from (db, jb).  Nothing past this
+         * point runs -- no cascade, no reference entry, no exclusion test,
+         * no survivor list -- so an unsafe/no-refinement config costs exactly
+         * the row argmin and nothing else. */
+        if constexpr (!REFINE) {
+            if (lane == 0) {
+                jbest[i]    = jb;
+                dbest[i]    = db;
+                gbest[i]    = gb;
+                bestpack[i] = mpk_pack(db, jb);
+            }
+            continue;
+        }
 
         /* ---- 2. cascade: condition (3) first, because it is free ---------
          * (3) needs no high precision quantity, so a row it clears completely
@@ -291,7 +323,7 @@ __global__ void k_argmin_count(const float* __restrict__ G,
                     const int j     = c0 + lane;
                     const bool live = (j < k && j != jb);
                     const bool keep = live && survives<true, false>(
-                                                  g[j], cnorm2[j], t3, factor, slack);
+                                                  g_load(g, j), cnorm2[j], t3, factor, slack);
                     c3 += __popc(__ballot_sync(FULL, keep));
 #ifdef MPK_STATS
                     n3 += __popc(__ballot_sync(FULL, live && !keep));
@@ -372,14 +404,14 @@ __global__ void k_argmin_count(const float* __restrict__ G,
                 const int j = c0 + lane;
                 const bool live = (j < k && j != jb);
                 const bool keep = live &&
-                    survives<C3, C6>(g[j], cnorm2[j], t0, factor, slack);
+                    survives<C3, C6>(g_load(g, j), cnorm2[j], t0, factor, slack);
                 cnt += __popc(__ballot_sync(FULL, keep));
 #ifdef MPK_STATS
                 bool h3 = false, h6 = false;
                 if (live) {
-                    h3 = C3 && !survives<true, false>(g[j], cnorm2[j], t0,
+                    h3 = C3 && !survives<true, false>(g_load(g, j), cnorm2[j], t0,
                                                       factor, slack);
-                    h6 = C6 && !survives<false, true>(g[j], cnorm2[j], t0,
+                    h6 = C6 && !survives<false, true>(g_load(g, j), cnorm2[j], t0,
                                                       factor, slack);
                 }
                 if constexpr (!CASCADE) n3 += __popc(__ballot_sync(FULL, h3));
@@ -414,7 +446,7 @@ __global__ void k_argmin_count(const float* __restrict__ G,
             for (int c0 = 0; c0 < k; c0 += WARP) {
                 const int j = c0 + lane;
                 const bool keep = (j < k && j != jb) &&
-                    survives<C3, C6>(g[j], cnorm2[j], t0, factor, slack);
+                    survives<C3, C6>(g_load(g, j), cnorm2[j], t0, factor, slack);
                 const unsigned int m = __ballot_sync(FULL, keep);
                 if (keep) {
                     const unsigned int slot =
@@ -535,8 +567,8 @@ __global__ void k_unpack(const unsigned long long* __restrict__ bestpack,
  * searching a survivor list: the flat list holds exactly the pairs for which
  * survives<C3,C6>() is true, so asking the test again about (i, r) answers
  * "was r in the list" exactly, without the list being sorted or indexed. */
-template <bool C3, bool C6>
-__global__ void k_verify_ref(const float* __restrict__ G,
+template <typename GT, bool C3, bool C6>
+__global__ void k_verify_ref(const GT* __restrict__ G,
                              const float* __restrict__ G32,
                              const float* __restrict__ cnorm2,
                              const int* __restrict__ jbest,
@@ -562,7 +594,7 @@ __global__ void k_verify_ref(const float* __restrict__ G,
                                     C6 ? gexact[i] : 0.f,
                                     C6 ? cnorm2[jb] : 0.f,
                                     gfac, slack, C3, C6);
-        reachable = survives<C3, C6>(G[(size_t)i * k + r], cnorm2[r], t0,
+        reachable = survives<C3, C6>(g_load(G + (size_t)i * k, r), cnorm2[r], t0,
                                      factor, slack);
     }
     if (!reachable) atomicAdd(n_excluded_best, 1ull);
@@ -675,11 +707,14 @@ static inline int rowgrid(int n, int cap) {
 }
 
 /* C3/C6 are compile time, so the configuration is dispatched here.  REF (the
- * condition (6) reference entry) is needed exactly when (6) is enabled. */
-void mpkLaunchArgminCount(const float* G, const float* cnorm2, const float* dP,
+ * condition (6) reference entry) is needed exactly when (6) is enabled.
+ * GT is the storage type of G (see k_argmin_count).  refine == 0 selects the
+ * no-refinement short circuit and ignores use_cond3/use_cond6/cascade. */
+template <typename GT>
+void mpkLaunchArgminCount(const GT* G, const float* cnorm2, const float* dP,
                           const float* dC, int n, int d, int k,
                           float factor, float gfac, float slack,
-                          int use_cond3, int use_cond6, int cascade,
+                          int use_cond3, int use_cond6, int cascade, int refine,
                           int* jbest, float* dbest, float* gbest, float* gexact,
                           unsigned long long* bestpack, int include_best,
                           int* list, int cap, unsigned int* count,
@@ -687,19 +722,21 @@ void mpkLaunchArgminCount(const float* G, const float* cnorm2, const float* dP,
                           long long* stat_banks, cudaStream_t s) {
     const int grid = rowgrid(n, 8192);
     unsigned long long* b = (unsigned long long*)stat_banks;
-#define MPK_ARGMIN_LAUNCH(IPT, REF, C3, C6, CAS)                              \
-    k_argmin_count<IPT, REF, C3, C6, CAS><<<grid, NTHR, 0, s>>>(              \
+#define MPK_ARGMIN_LAUNCH(IPT, REF, C3, C6, CAS, RFN)                         \
+    k_argmin_count<GT, IPT, REF, C3, C6, CAS, RFN><<<grid, NTHR, 0, s>>>(      \
         G, cnorm2, dP, dC, n, d, k, factor, gfac, slack,                      \
         jbest, dbest, gbest, gexact, bestpack, include_best, list, cap,       \
         count, ref_count, b)
 #define MPK_ARGMIN_BY_COND(IPT)                                               \
     do {                                                                      \
-        if (use_cond3 && use_cond6) {                                         \
-            if (cascade) MPK_ARGMIN_LAUNCH(IPT, true, true, true, true);      \
-            else         MPK_ARGMIN_LAUNCH(IPT, true, true, true, false);     \
+        if (!refine) {                                                        \
+            MPK_ARGMIN_LAUNCH(IPT, false, false, false, false, false);        \
+        } else if (use_cond3 && use_cond6) {                                  \
+            if (cascade) MPK_ARGMIN_LAUNCH(IPT, true, true, true, true, true); \
+            else         MPK_ARGMIN_LAUNCH(IPT, true, true, true, false, true);\
         }                                                                     \
-        else if (use_cond3) MPK_ARGMIN_LAUNCH(IPT, false, true, false, false);\
-        else                MPK_ARGMIN_LAUNCH(IPT, true, false, true, false); \
+        else if (use_cond3) MPK_ARGMIN_LAUNCH(IPT, false, true, false, false, true);\
+        else                MPK_ARGMIN_LAUNCH(IPT, true, false, true, false, true); \
     } while (0)
     /* Register residency pays only for a couple of columns per lane; past
      * k = 64 it measured slower than streaming the row.  IPT must cover the
@@ -711,6 +748,14 @@ void mpkLaunchArgminCount(const float* G, const float* cnorm2, const float* dP,
 #undef MPK_ARGMIN_BY_COND
 #undef MPK_ARGMIN_LAUNCH
 }
+template void mpkLaunchArgminCount<float>(const float*, const float*, const float*,
+    const float*, int, int, int, float, float, float, int, int, int, int,
+    int*, float*, float*, float*, unsigned long long*, int, int*, int,
+    unsigned int*, unsigned long long*, long long*, cudaStream_t);
+template void mpkLaunchArgminCount<__half>(const __half*, const float*, const float*,
+    const float*, int, int, int, float, float, float, int, int, int, int,
+    int*, float*, float*, float*, unsigned long long*, int, int*, int,
+    unsigned int*, unsigned long long*, long long*, cudaStream_t);
 
 void mpkLaunchRowArgmin32(const float* G32, const float* cnorm2, int n, int k,
                           int* assign, cudaStream_t s) {
@@ -758,7 +803,10 @@ void mpkLaunchInertia(const float* dP, const float* dC, const int* assign, int n
 }
 
 #ifdef MPK_STATS
-void mpkLaunchVerifyRef(const float* G, const float* G32, const float* cnorm2,
+/* GT matches whatever mpkLaunchArgminCount ran with -- G here is the mixed
+ * run's own distance matrix, not the always-FP32 oracle G32. */
+template <typename GT>
+void mpkLaunchVerifyRef(const GT* G, const float* G32, const float* cnorm2,
                         const int* jbest, const float* dbest, const float* gbest,
                         const float* gexact, const int* assign, const int* ref,
                         int n, int k, float factor, float gfac, float slack,
@@ -769,12 +817,26 @@ void mpkLaunchVerifyRef(const float* G, const float* G32, const float* cnorm2,
     unsigned long long* eb = (unsigned long long*)n_excluded_best;
     unsigned long long* ld = (unsigned long long*)n_label_diff;
 #define MPK_VERIFY_LAUNCH(C3, C6)                                             \
-    k_verify_ref<C3, C6><<<grid, NTHR, 0, s>>>(                               \
+    k_verify_ref<GT, C3, C6><<<grid, NTHR, 0, s>>>(                           \
         G, G32, cnorm2, jbest, dbest, gbest, gexact, assign, ref, n, k,       \
         factor, gfac, slack, eb, ld, excess)
+    /* refine==false runs (see k_argmin_count) still call this with
+     * use_cond3 == use_cond6 == 0, which is a real request here: it means
+     * "no exclusion test", not "condition (6) alone" -- survives<false,false>
+     * is trivially true, so n_excluded_best stays vacuously 0 while
+     * n_label_diff/excess still score the low precision argmin for real. */
     if (use_cond3 && use_cond6) MPK_VERIFY_LAUNCH(true, true);
     else if (use_cond3)         MPK_VERIFY_LAUNCH(true, false);
-    else                        MPK_VERIFY_LAUNCH(false, true);
+    else if (use_cond6)         MPK_VERIFY_LAUNCH(false, true);
+    else                        MPK_VERIFY_LAUNCH(false, false);
 #undef MPK_VERIFY_LAUNCH
 }
+template void mpkLaunchVerifyRef<float>(const float*, const float*, const float*,
+    const int*, const float*, const float*, const float*, const int*, const int*,
+    int, int, float, float, float, int, int,
+    long long*, long long*, double*, cudaStream_t);
+template void mpkLaunchVerifyRef<__half>(const __half*, const float*, const float*,
+    const int*, const float*, const float*, const float*, const int*, const int*,
+    int, int, float, float, float, int, int,
+    long long*, long long*, double*, cudaStream_t);
 #endif

@@ -27,6 +27,7 @@ option(MPK_STATS "collect exclusion statistics and enable the FP64 oracle" OFF)
 
 add_library(mpkmeans STATIC
     src/kernels.cu
+    src/baseline.cu
     src/mpkmeans.cu
     src/data.cu)
 add_library(mpkmeans::mpkmeans ALIAS mpkmeans)

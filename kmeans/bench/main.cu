@@ -39,9 +39,24 @@ static void usage(const char* p) {
            "  -s <float>     blob standard deviation    (default 1.0)\n"
            "  -b <float>     center box half width      (default 10.0)\n"
            "  -i <int>       max iterations             (default 50)\n"
+           "  --maxiters <int>  same as -i\n"
            "  -e <int>       rng seed                   (default 1)\n"
            "  -r <int>       timed repeats, last wins   (default 1)\n"
-           "  --only <c>     run one config only: 3, 6, 36 or c (cascade)\n"
+           "  --dataset <f>  LIBSVM file instead of blobs; n and d come from\n"
+           "                 the file and -n/-d are ignored\n"
+           "  --convergence  iterate to convergence rather than a fixed count:\n"
+           "                 stop at max_j ||c_j - c_j_prev||_2 < tol, or at\n"
+           "                 --maxiters, whichever comes first\n"
+           "  --tol <float>  the tolerance above         (default 1e-8)\n"
+           "  --theta <f>    rt-base safety factor of (4.13), must be > 2\n"
+           "                 (default 5, the value used throughout the paper)\n"
+           "  --accum <a>    low precision GEMM accumulator: fp32 or fp16\n"
+           "                 (default fp32; mpkMeansMixed configs only --\n"
+           "                  rt-base and fp32 are unaffected)\n"
+           "  --only <c>     run one config only: 3, 6, 36, c (cascade),\n"
+           "                 rt (arXiv:2407.12208 baseline), raw (no exclusion\n"
+           "                 test, no FP32 refinement -- the low precision\n"
+           "                 argmin trusted outright, no correctness guarantee)\n"
            "  --no-verify    skip the per-iteration FP64 oracle check\n"
            "                 (the oracle needs a -DMPK_STATS=ON build; it is\n"
            "                  on by default there and absent otherwise)\n"
@@ -52,20 +67,25 @@ static void usage(const char* p) {
 
 /* Fraction of points whose (mixed, fp32) cluster labels agree after matching
  * the two labelings greedily by contingency-table mass. */
+/* ka and kb need not be equal: on a real dataset the label column has however
+ * many classes it has, which is rarely the k we cluster into.  The greedy
+ * matching then runs for min(ka, kb) steps and the rest counts as disagreement,
+ * so the number is only comparable across configurations, never an accuracy. */
 static double label_agreement(const std::vector<int>& a, const std::vector<int>& b,
-                              int k) {
-    std::vector<long long> cont((size_t)k * k, 0);
-    for (size_t i = 0; i < a.size(); ++i) cont[(size_t)a[i] * k + b[i]]++;
-    std::vector<char> used_a(k, 0), used_b(k, 0);
+                              int ka, int kb) {
+    std::vector<long long> cont((size_t)ka * kb, 0);
+    for (size_t i = 0; i < a.size(); ++i) cont[(size_t)a[i] * kb + b[i]]++;
+    std::vector<char> used_a(ka, 0), used_b(kb, 0);
     long long matched = 0;
-    for (int step = 0; step < k; ++step) {
+    const int steps = ka < kb ? ka : kb;
+    for (int step = 0; step < steps; ++step) {
         long long best = -1; int bi = -1, bj = -1;
-        for (int i = 0; i < k; ++i) {
+        for (int i = 0; i < ka; ++i) {
             if (used_a[i]) continue;
-            for (int j = 0; j < k; ++j) {
+            for (int j = 0; j < kb; ++j) {
                 if (used_b[j]) continue;
-                if (cont[(size_t)i * k + j] > best) {
-                    best = cont[(size_t)i * k + j]; bi = i; bj = j;
+                if (cont[(size_t)i * kb + j] > best) {
+                    best = cont[(size_t)i * kb + j]; bi = i; bj = j;
                 }
             }
         }
@@ -78,24 +98,39 @@ static double label_agreement(const std::vector<int>& a, const std::vector<int>&
 
 struct Config {
     const char* name;
-    int cond3, cond6, cascade;
+    int cond3, cond6, cascade, baseline;
 };
 
 /* (3)->(6) is the cascade: the same exclusions as (3)+(6), but the reference
  * entry -- and with it the FP32 read of P, which is what (6) costs -- is
  * evaluated only for the rows (3) did not clear outright. */
-#define MPK_NCFG 4
+/* rt-base is the arXiv:2407.12208 reliability-test scheme, a different
+ * strategy entirely (per-entry cancellation test, not cluster exclusion), run
+ * here as a baseline. */
+/* raw asks mpkMeansMixed for cond3 = cond6 = 0, which used to be an error and
+ * is now the no-refinement mode: the low precision argmin is trusted outright,
+ * with no exclusion test and no FP32 recomputation at all.  It has no
+ * correctness guarantee -- it is the naive scheme Theorem 1 exists to make
+ * safe -- and is here so that guarantee has something to be measured against. */
+#define MPK_NCFG 6
 static const Config kConfigs[MPK_NCFG] = {
-    {"(3)",     1, 0, 0},
-    {"(6)",     0, 1, 0},
-    {"(3)+(6)", 1, 1, 0},
-    {"(3)->(6)",1, 1, 1},
+    {"(3)",     1, 0, 0, 0},
+    {"(6)",     0, 1, 0, 0},
+    {"(3)+(6)", 1, 1, 0, 0},
+    {"(3)->(6)",1, 1, 1, 0},
+    {"rt-base", 0, 0, 0, 1},
+    {"raw",     0, 0, 0, 0},
 };
 
 int main(int argc, char** argv) {
     int   n = 200000, d = 64, k = 32, max_iter = 50, seed = 1, repeats = 1;
     float blob_std = 1.0f, box = 10.0f;
     int   verify = 1, verbose = 0, csv = 0, only = -1;
+    const char* dataset = nullptr;
+    int   converge = 0;
+    float tol = 1e-8f;
+    float rt_theta = 0.f;      /* 0 -> the paper's 5 */
+    int   accum = MPK_ACCUM_FP32;
 
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
@@ -108,14 +143,26 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "-k")) k = atoi(next());
         else if (!strcmp(a, "-s")) blob_std = (float)atof(next());
         else if (!strcmp(a, "-b")) box = (float)atof(next());
-        else if (!strcmp(a, "-i")) max_iter = atoi(next());
+        else if (!strcmp(a, "-i") || !strcmp(a, "--maxiters"))
+            max_iter = atoi(next());
+        else if (!strcmp(a, "--dataset")) dataset = next();
+        else if (!strcmp(a, "--convergence")) converge = 1;
+        else if (!strcmp(a, "--tol")) tol = (float)atof(next());
+        else if (!strcmp(a, "--theta")) rt_theta = (float)atof(next());
+        else if (!strcmp(a, "--accum")) {
+            const char* v = next();
+            if      (!strcmp(v, "fp32")) accum = MPK_ACCUM_FP32;
+            else if (!strcmp(v, "fp16")) accum = MPK_ACCUM_FP16;
+            else { usage(argv[0]); return 1; }
+        }
         else if (!strcmp(a, "-e")) seed = atoi(next());
         else if (!strcmp(a, "-r")) repeats = atoi(next());
         else if (!strcmp(a, "--no-verify")) verify = 0;
         else if (!strcmp(a, "--only")) {
             const char* v = next();
             only = !strcmp(v, "3") ? 0 : !strcmp(v, "6") ? 1 :
-                   !strcmp(v, "36") ? 2 : !strcmp(v, "c") ? 3 : -1;
+                   !strcmp(v, "36") ? 2 : !strcmp(v, "c") ? 3 :
+                   !strcmp(v, "rt") ? 4 : !strcmp(v, "raw") ? 5 : -1;
             if (only < 0) { usage(argv[0]); return 1; }
         }
         else if (!strcmp(a, "-v")) verbose = 1;
@@ -131,29 +178,55 @@ int main(int argc, char** argv) {
         }
         else { usage(argv[0]); return 1; }
     }
+    /* A dataset defines n and d -- only the file knows them -- so it is read
+     * before anything that depends on the shape, and -n/-d are ignored. */
+    float* hP = nullptr;
+    std::vector<int> hTruth;
+    int n_truth_classes = k;
+    if (dataset) {
+        int fn = 0, fd = 0, nc = 0; int* lab = nullptr;
+        if (mpkLoadLibsvm(dataset, &fn, &fd, &hP, &lab, &nc) != MPK_OK) return 1;
+        n = fn; d = fd; n_truth_classes = nc;
+        hTruth.assign(lab, lab + n);
+        free(lab);
+    }
     if (n <= 0 || d <= 0 || k <= 0 || k > n) { usage(argv[0]); return 1; }
 
     cudaDeviceProp prop;
     CHK(cudaGetDeviceProperties(&prop, 0));
-    const double eps = mpkEpsilon(d);
+    const double eps = mpkEpsilon(d, accum);
     if (eps < 0) {
-        fprintf(stderr, "error model degenerate for d=%d in this mode\n", d);
+        fprintf(stderr, "error model degenerate for d=%d, accum=%s\n", d,
+                accum == MPK_ACCUM_FP16 ? "fp16" : "fp32");
         return 1;
     }
     if (!csv) {
         printf("device   : %s (sm_%d%d)\n", prop.name, prop.major, prop.minor);
-        printf("problem  : n=%d d=%d k=%d  blobs(std=%.3g, box=%.3g, seed=%d)\n",
-               n, d, k, blob_std, box, seed);
-        printf("gemm     : FP16 operands, FP32 accumulate\n");
+        if (dataset)
+            printf("problem  : n=%d d=%d k=%d  %s (%d classes in the label "
+                   "column)\n", n, d, k, dataset, n_truth_classes);
+        else
+            printf("problem  : n=%d d=%d k=%d  blobs(std=%.3g, box=%.3g, "
+                   "seed=%d)\n", n, d, k, blob_std, box, seed);
+        if (converge)
+            printf("stopping : max_j ||c_j - c_j_prev||_2 < %.3g, or %d "
+                   "iterations\n", tol, max_iter);
+        else
+            printf("stopping : label stability, or %d iterations\n", max_iter);
+        printf("gemm     : FP16 operands, %s accumulate (rt-base is always FP32)\n",
+               accum == MPK_ACCUM_FP16 ? "FP16" : "FP32");
         printf("eps      : %.6e   ->  factor 2*eps/(1-eps) = %.6e\n",
                eps, 2.0 * eps / (1.0 - eps));
         printf("update   : flat survivor list, one warp per entry, FP32\n");
     }
 
     /* ------------------------------------------------------------ data --- */
-    std::vector<float> hP((size_t)n * d);
-    std::vector<int>   hTruth(n);
-    mpkMakeBlobs(n, d, k, blob_std, box, (unsigned)seed, hP.data(), hTruth.data());
+    if (!dataset) {
+        hP = (float*)malloc((size_t)n * d * sizeof(float));
+        if (!hP) { fprintf(stderr, "out of host memory\n"); return 1; }
+        hTruth.resize(n);
+        mpkMakeBlobs(n, d, k, blob_std, box, (unsigned)seed, hP, hTruth.data());
+    }
 
     float *dP = nullptr, *dCmix = nullptr, *dCref = nullptr, *dC0 = nullptr;
     int   *dAmix = nullptr, *dAref = nullptr;
@@ -163,13 +236,27 @@ int main(int argc, char** argv) {
     CHK(cudaMalloc(&dC0,   (size_t)k * d * sizeof(float)));
     CHK(cudaMalloc(&dAmix, (size_t)n * sizeof(int)));
     CHK(cudaMalloc(&dAref, (size_t)n * sizeof(int)));
-    CHK(cudaMemcpy(dP, hP.data(), (size_t)n * d * sizeof(float),
+    CHK(cudaMemcpy(dP, hP, (size_t)n * d * sizeof(float),
                    cudaMemcpyHostToDevice));
+    free(hP); hP = nullptr;
 
-    /* preprocessing required by conditions (3) and (6) */
+    /* Conditions (3) and (6) need a non-negative P; the arXiv:2407.12208
+     * baseline does not, and the shift actively hurts it -- it inflates
+     * ||p||^2 and so the error floor E_l, which is exactly what its
+     * reliability test measures against.  Adding a scalar to every entry is a
+     * rigid translation, so it leaves all distances and the clustering
+     * untouched and only changes the conditioning: keeping an unshifted copy
+     * and giving it to the baseline compares each method on the data it is
+     * meant to run on. */
+    float* dPraw = nullptr;
+    CHK(cudaMalloc((void**)&dPraw, (size_t)n * d * sizeof(float)));
+    CHK(cudaMemcpy(dPraw, dP, (size_t)n * d * sizeof(float),
+                   cudaMemcpyDeviceToDevice));
+
     float shift = 0.f;
     if (mpkShiftNonNegative(dP, n, d, &shift) != MPK_OK) return 1;
-    if (!csv) printf("shift    : P += %.6g (all entries non-negative)\n", shift);
+    if (!csv) printf("shift    : P += %.6g for (3)/(6); rt-base runs unshifted\n",
+                     shift);
 
     if (mpkInitRandomPoints(dP, n, d, k, (unsigned)seed, dC0) != MPK_OK) return 1;
 
@@ -177,6 +264,9 @@ int main(int argc, char** argv) {
 
     mpkParams par; mpkParamsInit(&par);
     par.max_iter      = max_iter;
+    par.tol           = converge ? tol : 0.f;
+    par.rt_theta      = rt_theta;
+    par.accum         = accum;
     par.verbose       = verbose;
 
     mpkStats smix[MPK_NCFG], sref;
@@ -190,6 +280,9 @@ int main(int argc, char** argv) {
         CHK(cudaMemcpy(dCmix, dC0, (size_t)k * d * sizeof(float),
                        cudaMemcpyDeviceToDevice));
         mpkMeansMixed(blas, dP, n, d, k, dCmix, dAmix, &w, &junk);
+        CHK(cudaMemcpy(dCmix, dC0, (size_t)k * d * sizeof(float),
+                       cudaMemcpyDeviceToDevice));
+        mpkMeansBaselineRT(blas, dPraw, n, d, k, dCmix, dAmix, &w, &junk);
         CHK(cudaMemcpy(dCref, dC0, (size_t)k * d * sizeof(float),
                        cudaMemcpyDeviceToDevice));
         mpkMeansFP32(blas, dP, n, d, k, dCref, dAref, &w, &junk);
@@ -218,8 +311,16 @@ int main(int argc, char** argv) {
             CHK(cudaMemcpy(dCmix, dC0, (size_t)k * d * sizeof(float),
                            cudaMemcpyDeviceToDevice));
             par.verify = (r == repeats - 1) ? verify : 0;
-            if (mpkMeansMixed(blas, dP, n, d, k, dCmix, dAmix, &par,
-                              &smix[c]) != MPK_OK) {
+            /* dC0 was picked from the shifted P; undo it for the baseline so
+             * both start from the same points in their own frame */
+            if (kConfigs[c].baseline)
+                mpkShiftCentroids(dCmix, k, d, -shift);
+            const mpkStatus rc = kConfigs[c].baseline
+                ? mpkMeansBaselineRT(blas, dPraw, n, d, k, dCmix, dAmix, &par,
+                                     &smix[c])
+                : mpkMeansMixed(blas, dP, n, d, k, dCmix, dAmix, &par,
+                                &smix[c]);
+            if (rc != MPK_OK) {
                 fprintf(stderr, "mixed %s failed\n", kConfigs[c].name);
                 return 1;
             }
@@ -265,7 +366,7 @@ int main(int argc, char** argv) {
     }
     if (csv) {
         cublasDestroy(blas);
-        cudaFree(dP); cudaFree(dCmix); cudaFree(dCref); cudaFree(dC0);
+        cudaFree(dP); cudaFree(dPraw); cudaFree(dCmix); cudaFree(dCref); cudaFree(dC0);
         cudaFree(dAmix); cudaFree(dAref);
         return ok ? 0 : 2;
     }
@@ -372,6 +473,24 @@ int main(int argc, char** argv) {
     printf("  %-8s %10.3f %9s %8.2f\n", "fp32",
            sref.t_dist_ms / fmax(sref.iters, 1), "1.000x", sref.t_update_ms);
 
+    /* The FP32 refinement is the same kernel for every scheme here -- one warp
+     * per flagged entry, WPB=8, 256 threads, the same grid cap -- differing
+     * only in whether it forms p.c or ||p-c||^2.  So its cost is a count, not
+     * a rate, and the schemes are separated by how many entries they flag, not
+     * by how fast they refine one.  ns/entry says whether that holds: if two
+     * schemes disagree there, something other than the count is at work. */
+    printf("\n  refinement cost, normalised -- same kernel for every scheme\n");
+    printf("  %-8s %14s %12s %12s\n", "cond", "entries/iter", "ms/iter",
+           "ns/entry");
+    for (int c = 0; c < MPK_NCFG; ++c) {
+        if (only >= 0 && only != c) continue;
+        const mpkStats& S = smix[c];
+        const double it = fmax(S.iters, 1);
+        printf("  %-8s %14.1f %12.4f %12.2f\n", kConfigs[c].name,
+               (double)S.hp_update / it, S.t_hp_update_ms / it,
+               S.hp_update ? S.t_hp_update_ms * 1e6 / (double)S.hp_update : 0.0);
+    }
+
     /* ---------------------------------------------------- verification --- */
     /* Two separate claims, and they are not the same thing:
      *
@@ -404,7 +523,17 @@ int main(int argc, char** argv) {
                "  incumbent nor among the survivors, so a condition of Theorem 1\n"
                "  does not hold.  label != fp32 label counts rows where the FP32\n"
                "  answer was reachable but not chosen; excess is what that cost\n"
-               "  in the FP32 distances themselves.\n");
+               "  in the FP32 distances themselves.\n"
+               "  rt-base has no per-iteration hookup into this oracle at all --\n"
+               "  a different strategy entirely -- so its row always reads\n"
+               "  0/rows: an absence of measurement, not a passing check.\n"
+               "  raw ran no exclusion test, so \"reachable\" is trivially every\n"
+               "  row: its bound violations column is 0 by construction, for the\n"
+               "  same reason, but label != fp32 label and excess are real --\n"
+               "  they score how often trusting the low precision argmin outright\n"
+               "  got the wrong answer, and by how much.\n"
+               "  The clustering table below is the other way to see this, for\n"
+               "  every scheme including rt-base.\n");
     } else if (verify) {
         printf("  -- SKIPPED: this binary was built without MPK_STATS, so the\n"
                "  FP64 oracle is compiled out.  Rebuild with -DMPK_STATS=ON.\n");
@@ -423,10 +552,10 @@ int main(int argc, char** argv) {
         printf("  %-8s inertia rel diff %.3e   labels == fp32 %.3f%%   "
                "truth %.4f\n", kConfigs[c].name, rel,
                100.0 * (double)identical / n,
-               label_agreement(amix[c], hTruth, k));
+               label_agreement(amix[c], hTruth, k, n_truth_classes));
     }
     printf("  %-8s %54s truth %.4f\n", "fp32", "",
-           label_agreement(aref, hTruth, k));
+           label_agreement(aref, hTruth, k, n_truth_classes));
 
     /* The theorem guarantees the true nearest centroid is never filtered out.
      * It does not guarantee bit-identical labels to an FP32 run: once an FP32
@@ -436,7 +565,7 @@ int main(int argc, char** argv) {
 
 
     cublasDestroy(blas);
-    cudaFree(dP); cudaFree(dCmix); cudaFree(dCref); cudaFree(dC0);
+    cudaFree(dP); cudaFree(dPraw); cudaFree(dCmix); cudaFree(dCref); cudaFree(dC0);
     cudaFree(dAmix); cudaFree(dAref);
     return ok ? 0 : 2;
 }

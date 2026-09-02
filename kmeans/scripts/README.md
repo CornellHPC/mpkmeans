@@ -109,6 +109,59 @@ REPS=3 PTS="64:64 128:64" BOXES=10 ./scripts/bench.sh    # quick check
 
 ---
 
+## Real data and convergence runs
+
+Both gates above use synthetic blobs, which is what you want while changing
+kernels — the shape is a knob. For a run on real data, or for iterating to
+convergence instead of a fixed count, the bench takes these directly:
+
+| flag | meaning |
+|---|---|
+| `--dataset <file>` | LIBSVM/SVMlight sparse text, densified to `n x d`. `n` is the number of non-empty lines and `d` the largest feature index, both read from the file; `-n` and `-d` are ignored. The label column becomes the ground truth for the `truth` column, renumbered in order of first appearance, and its class count need not equal `k`. |
+| `--maxiters <int>` | same as `-i`. |
+| `--convergence` | stop at `max_j ||c_j - c_j_prev||_2 < tol` or at `--maxiters`, whichever comes first, instead of at label stability. |
+| `--tol <float>` | that tolerance, default `1e-8`. |
+| `--theta <float>` | the `rt-base` safety factor of (4.13), default 5 (the paper's value). Must be `> 2`. |
+
+```
+./build-stats/mpkmeans_bench --dataset data/foo.libsvm -k 64 \
+    --convergence --maxiters 300
+```
+
+Two things to know before reading the output of a convergence run:
+
+- At `1e-8` in FP32 the tolerance is essentially "the centroids did not move",
+  so it usually fires on the same iteration as label stability. It separates
+  from it only at looser tolerances — `1e-1` on the single-blob case stops at
+  15 iterations where label stability takes 269.
+- Configurations may stop at *different* iterations, so compare `ms/iter`, not
+  the run totals. The `iters` column is printed for exactly this reason.
+
+## Reading the timing tables
+
+Three tables come out of every run, and they answer different questions.
+
+- **`timing`** — totals over the run, per phase. Only comparable between
+  configurations that ran the same number of iterations.
+- **`ms/iter` / `vs fp32`** — the headline. `update` beside it is the centroid
+  recomputation, which is identical code in every scheme and excluded from
+  `ms/iter`; it should read roughly the same for all of them.
+- **`refinement cost, normalised`** — `entries/iter`, `ms/iter`, `ns/entry` for
+  the FP32 refinement. Every scheme here refines with the *same* kernel (one
+  warp per flagged entry, `WPB=8`, 256 threads, the same grid cap), differing
+  only in whether it forms `p.c` or `||p-c||^2`. So a scheme's refinement cost
+  is a **count**, not a rate, and `ns/entry` is the check on that: if two
+  schemes disagree there, something other than the count is at work and the
+  comparison is not apples to apples. In practice they agree to within a
+  factor of two, and `rt-base` sits at the cheap end because its flagged
+  entries come in dense runs of consecutive `j` within a row.
+
+  The exception is a nearly empty kernel: at `-b 0`, `rt-base` flags ~117
+  entries per iteration and `ns/entry` reads ~80, which is launch overhead
+  divided by almost nothing, not a per-entry cost.
+
+---
+
 ## Diagnostics
 
 Reach for these when a gate number moves and you want the cause. None of them

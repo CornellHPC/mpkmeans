@@ -61,9 +61,15 @@ void mpkLaunchRowNorms(const float* dC, int k, int d, float* out,
  *   row_nnz[i] how many columns survived the exclusion test
  *
  * The row of G is scanned twice, once for the argmin and once for the test,
- * but only the first scan reaches past L1: a row is k*4 bytes and is still
- * resident for the second.  Running the test as a separate kernel meant
+ * but only the first scan reaches past L1: a row is k*sizeof(GT) bytes and is
+ * still resident for the second.  Running the test as a separate kernel meant
  * streaming all of G from HBM a second time and repeating the per-row setup.
+ *
+ * GT is G's storage type: float for an FP32-accumulate GEMM, __half for an
+ * FP16-accumulate one.  It is read at its native width and widened to float
+ * only in the register that holds it, so the FP16-accumulate path keeps its
+ * whole point -- a distance matrix half the size -- rather than paying for a
+ * conversion pass back to float.  Instantiated for float and __half below.
  *
  * gexact is a warp-strided fma dot in registers.  Materialising
  * prod(i,:) = P(i,:)*C(jbest[i],:) and reducing it with a cublasSgemv instead
@@ -95,12 +101,19 @@ void mpkLaunchRowNorms(const float* dC, int k, int d, float* out,
  * reference entry computed, the incumbent's own high precision distance is
  * instead produced by the update step -- but only for rows (3) did not clear.
  *
+ * refine == 0 skips the cascade, the reference entry and the exclusion test
+ * entirely and packs the low precision argmin (db, jb) as the final answer --
+ * use_cond3/use_cond6/cascade are ignored in that case.  This is a distinct
+ * code path, not use_cond3 == use_cond6 == 0 with refine == 1, which would
+ * flag every column a survivor and refine the whole row in FP32.
+ *
  * stat_banks is 3*MPK_STAT_BANKS device counters (cond3, cond6, both) and is
  * only touched in MPK_STATS builds; pass NULL otherwise. */
-void mpkLaunchArgminCount(const float* G, const float* cnorm2, const float* dP,
+template <typename GT>
+void mpkLaunchArgminCount(const GT* G, const float* cnorm2, const float* dP,
                           const float* dC, int n, int d, int k,
                           float factor, float gfac, float slack,
-                          int use_cond3, int use_cond6, int cascade,
+                          int use_cond3, int use_cond6, int cascade, int refine,
                           int* jbest, float* dbest, float* gbest, float* gexact,
                           unsigned long long* bestpack, int include_best,
                           int* list, int cap, unsigned int* count,
@@ -160,7 +173,8 @@ void mpkLaunchInertia(const float* dP, const float* dC, const int* assign,
  *   n_label_diff    += the FP32 label was reachable but not the one picked,
  *   excess          += D32(i, assign[i]) - D32(i, ref[i]).
  * Counters accumulate; the caller zeroes them. */
-void mpkLaunchVerifyRef(const float* G, const float* G32, const float* cnorm2,
+template <typename GT>
+void mpkLaunchVerifyRef(const GT* G, const float* G32, const float* cnorm2,
                         const int* jbest, const float* dbest, const float* gbest,
                         const float* gexact, const int* assign, const int* ref,
                         int n, int k, float factor, float gfac, float slack,

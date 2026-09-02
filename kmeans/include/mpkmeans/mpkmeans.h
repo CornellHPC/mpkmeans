@@ -38,11 +38,35 @@ typedef enum {
     MPK_ERR_ALLOC = 5
 } mpkStatus;
 
+/* Accumulate precision of the low precision GEMM (mpkMeansMixed only; every
+ * other driver is fixed FP32).  Operands are FP16 either way -- this is only
+ * the accumulator cuBLAS uses while summing the d products of a row.
+ *
+ *   MPK_ACCUM_FP32  CUBLAS_COMPUTE_32F, G stored as float.  The default.
+ *   MPK_ACCUM_FP16  CUBLAS_COMPUTE_16F, G stored as __half -- half the
+ *                   distance matrix, at a worse error bound (see mpkEpsilon):
+ *                   the d-term sum now accumulates in FP16, not FP32. */
+typedef enum {
+    MPK_ACCUM_FP32 = 0,
+    MPK_ACCUM_FP16 = 1
+} mpkAccum;
+
 typedef struct {
     int   max_iter;       /* default 100                                      */
-    float tol;            /* stop when max centroid movement^2 < tol; def. 0   */
+    float tol;            /* convergence tolerance on the centroids: stop once
+                           * max_j ||c_j - c_j_prev||_2 < tol.  0 (the default)
+                           * disables it, leaving label stability -- no point
+                           * changed cluster -- as the only stopping rule.
+                           * Both rules are checked; whichever fires first
+                           * stops the run.                                    */
     int   use_cond3;      /* default 1                                        */
-    int   use_cond6;      /* default 1                                        */
+    int   use_cond6;      /* default 1.  With use_cond3 also 0, mpkMeansMixed
+                           * runs no exclusion test and no FP32 refinement at
+                           * all: the low precision argmin is trusted outright.
+                           * This has no correctness guarantee -- it is the
+                           * naive scheme Theorem 1 exists to make safe -- and
+                           * is meant for comparison, not for a run that needs
+                           * a right answer.                                   */
     int   cascade;        /* with both conditions on, apply (3) first and only
                            * compute the (6) reference entry for the rows (3)
                            * did not clear outright.  (3) needs no high
@@ -51,6 +75,12 @@ typedef struct {
                            * actually costs.  Exclusions are identical to the
                            * unconditional (3)+(6); only the work differs.
                            * Ignored unless both conditions are on.  default 0 */
+    int   accum;          /* mpkAccum, mpkMeansMixed only.  default
+                           * MPK_ACCUM_FP32                                    */
+    float rt_theta;       /* baseline only (mpkMeansBaselineRT): the safety
+                           * factor of arXiv:2407.12208 (4.13).  Must be > 2;
+                           * they use 5 throughout, which is the default when
+                           * this is <= 0.                                     */
     int   verify;         /* per-iteration FP64 oracle check (MPK_STATS only)  */
     int   verbose;        /* per-iteration log to stdout                       */
 } mpkParams;
@@ -109,15 +139,20 @@ void mpkParamsInit(mpkParams* p);
 
 /* Relative error bound eps such that
  *     |fl(p^T c) - p^T c| <= eps * (p^T c)      for p, c >= 0
- * for the FP16-operand, FP32-accumulate GEMM (CUBLAS_COMPUTE_32F) with inner
- * dimension d.  Returns a negative value if the model degenerates (eps >= 1),
- * which does not happen for any d reachable by this GEMM. */
-double mpkEpsilon(int d);
+ * for the FP16-operand GEMM with inner dimension d, accumulating in the
+ * precision named by `accum` (an mpkAccum).  Returns a negative value if the
+ * model degenerates (eps >= 1) -- for MPK_ACCUM_FP32 this does not happen for
+ * any d reachable by this GEMM; for MPK_ACCUM_FP16 it can, at far smaller d,
+ * since the d-term sum is accumulating in FP16 rather than FP32. */
+double mpkEpsilon(int d, int accum);
 
 /* Shift P in place by M = max_ij |P(i,j)| so that every entry is
  * non-negative, as required by conditions (3) and (6).  Distances are
  * translation invariant, so the clustering is unchanged.  Returns M. */
 mpkStatus mpkShiftNonNegative(float* dP, int n, int d, float* out_shift);
+
+/* Add `delta` to every entry of a k x d centroid block. */
+mpkStatus mpkShiftCentroids(float* dC, int k, int d, float delta);
 
 /* Mixed precision Lloyd's.
  *
@@ -132,12 +167,29 @@ mpkStatus mpkMeansMixed(cublasHandle_t blas,
                         const mpkParams* params, mpkStats* stats);
 
 /* Reference Lloyd's, everything in FP32 (TF32 disabled). */
+/* Baseline from arXiv:2407.12208, "Computing k-means in mixed precision":
+ * a per-entry reliability test on the expanded distance formula, with the
+ * failures recomputed by the direct formula in FP32.  Implemented separately
+ * in src/baseline.cu.  hp_update counts the corrected entries. */
+mpkStatus mpkMeansBaselineRT(cublasHandle_t blas, const float* dP, int n, int d,
+                             int k, float* dC, int* dAssign,
+                             const mpkParams* params, mpkStats* stats);
+
 mpkStatus mpkMeansFP32(cublasHandle_t blas,
                        const float* dP, int n, int d, int k,
                        float* dC, int* dAssign,
                        const mpkParams* params, mpkStats* stats);
 
 /* ---------------------------------------------------------------- data --- */
+
+/* Load a LIBSVM/SVMlight sparse text file as a dense row-major n x d matrix.
+ * n is the number of non-empty lines and d the largest feature index present;
+ * both are outputs, since only the file knows them.  *out_P (n*d floats) and
+ * *out_labels (n ints, the label column renumbered 0..nclasses-1 in order of
+ * first appearance) are malloc'd and belong to the caller.  out_labels and
+ * out_nclasses may be NULL.  The label count is NOT assumed to be k. */
+mpkStatus mpkLoadLibsvm(const char* path, int* out_n, int* out_d,
+                        float** out_P, int** out_labels, int* out_nclasses);
 
 /* Isotropic Gaussian blobs.  Centers are drawn uniformly from
  * [-center_box, center_box]^d, points from N(center, std^2 I).
