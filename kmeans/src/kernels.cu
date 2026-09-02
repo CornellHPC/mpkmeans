@@ -94,6 +94,23 @@ __global__ void k_row_norms(const float* __restrict__ C, int d,
  * The reassociation perturbs only the slack term, itself a deliberate
  * overestimate ~8*u32, so the net change is O(u32^2); the FP64 oracle checks
  * the result either way. */
+/* A row's running best as one 64 bit key, so the update kernel can reduce into
+ * it with a single atomicMin and no per-row structure of any kind.
+ *
+ * The float goes in the high 32 bits under the standard order preserving map
+ * (flip the sign bit for non-negatives, invert everything for negatives), so
+ * unsigned comparison of the key matches float comparison of the distance --
+ * distances here can be negative, since ||p||^2 is dropped.  The centroid
+ * index sits in the low bits, so an exact tie is broken towards the smaller
+ * index, which is what amin() does. */
+__device__ __forceinline__ unsigned int mpk_ford(float f) {
+    const unsigned int b = __float_as_uint(f);
+    return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+}
+__device__ __forceinline__ unsigned long long mpk_pack(float dist, int j) {
+    return ((unsigned long long)mpk_ford(dist) << 32) | (unsigned int)j;
+}
+
 struct RowTest {
     float lhs3;     /* dbest + slack*|dbest|               */
     float lhs6;     /* dup   + slack*|dup|                 */
@@ -179,7 +196,10 @@ __global__ void k_argmin_count(const float* __restrict__ G,
                                float* __restrict__ dbest,
                                float* __restrict__ gbest,
                                float* __restrict__ gexact,
-                               int* __restrict__ row_nnz, int include_best,
+                               unsigned long long* __restrict__ bestpack,
+                               int include_best,
+                               int* __restrict__ list, int cap,
+                               unsigned int* __restrict__ count,
                                unsigned long long* __restrict__ ref_count,
                                unsigned long long* __restrict__ banks) {
     using KV         = cub::KeyValuePair<int, float>;
@@ -300,27 +320,43 @@ __global__ void k_argmin_count(const float* __restrict__ G,
             jbest[i] = jb;
             dbest[i] = db;
             gbest[i] = gb;
-            if (REF && want_ref) gexact[i] = ge;
+            /* A cascade row that (3) cleared has no reference entry.  Writing 0
+             * rather than leaving it undefined keeps the filter's (6) term
+             * finite; it can only read "(6) excluded nothing here", which is
+             * exactly true, because (6) was never evaluated on that row. */
+            if (REF) gexact[i] = want_ref ? ge : 0.f;
+            /* Seed the row's best.  With (6) the incumbent's own FP32 distance
+             * is already known, so it competes from the start; with (3) there
+             * is none, so the incumbent is instead appended to the candidate
+             * list by the filter and INF lets it win. */
+            bestpack[i] = (REF && want_ref)
+                        ? mpk_pack(fmaf(-2.f, ge, cnorm2[jb]), jb)
+                        : mpk_pack(INFINITY, jb);
         }
 
-        /* ---- 4. the exclusion test over the rest of the row -------------- */
-        /* cnorm2[jb] is a uniform address into a k-element array: L1.  Under
-         * the cascade a row (3) already emptied is skipped outright: it has no
-         * reference entry, and it cannot gain survivors by adding (6). */
+        /* ---- 4. the exclusion test, emitting surviving flat indices ------
+         * This stays in the argmin kernel because the row is already here:
+         * with IPT > 0 it sits in registers and the test costs no traffic at
+         * all, and even when streamed it is hot in L1.  Splitting it into its
+         * own kernel measured slower for exactly one reason -- that kernel has
+         * to read the n x k row of G a second time. */
         const RowTest t0 = row_test(jb, db, gb, ge, C6 ? cnorm2[jb] : 0.f,
                                     gfac, slack, C3, C6);
+        constexpr int NM = IPT > 0 ? IPT : 1;
+        unsigned int mm[NM];
         int cnt = 0;
         if (CASCADE && !want_ref) {
-            /* nothing survived (3): fall through with cnt = 0 */
+#pragma unroll
+            for (int t = 0; t < NM; ++t) mm[t] = 0u;   /* (3) emptied the row */
         } else if constexpr (IPT > 0) {
-            /* gv and cn are already in registers: no memory traffic here */
 #pragma unroll
             for (int t = 0; t < IPT; ++t) {
                 const int j = lane + t * WARP;
                 const bool live = (j < k && j != jb);
                 const bool keep = live &&
                                   survives<C3, C6>(gv[t], cn[t], t0, factor, slack);
-                cnt += __popc(__ballot_sync(FULL, keep));
+                mm[t] = __ballot_sync(FULL, keep);
+                cnt += __popc(mm[t]);
 #ifdef MPK_STATS
                 const bool h3 = C3 && live &&
                     !survives<true, false>(gv[t], cn[t], t0, factor, slack);
@@ -334,15 +370,13 @@ __global__ void k_argmin_count(const float* __restrict__ G,
         } else {
             for (int c0 = 0; c0 < k; c0 += WARP) {
                 const int j = c0 + lane;
-                bool keep = false;
-                if (j < k && j != jb)
-                    keep = survives<C3, C6>(g[j], cnorm2[j], t0, factor, slack);
+                const bool live = (j < k && j != jb);
+                const bool keep = live &&
+                    survives<C3, C6>(g[j], cnorm2[j], t0, factor, slack);
                 cnt += __popc(__ballot_sync(FULL, keep));
 #ifdef MPK_STATS
-                /* attribution needs each condition on its own, so it costs an
-                 * extra evaluation; only compiled in for measurement runs */
                 bool h3 = false, h6 = false;
-                if (j < k && j != jb) {
+                if (live) {
                     h3 = C3 && !survives<true, false>(g[j], cnorm2[j], t0,
                                                       factor, slack);
                     h6 = C6 && !survives<false, true>(g[j], cnorm2[j], t0,
@@ -354,9 +388,44 @@ __global__ void k_argmin_count(const float* __restrict__ G,
 #endif
             }
         }
-        /* a row the conditions cleared completely needs no high precision work
-         * at all -- that is the point of the test */
-        if (lane == 0) row_nnz[i] = (cnt && include_best) ? cnt + 1 : cnt;
+
+        /* with (3) alone the incumbent has no reference entry of its own, so a
+         * row that kept anything has to price it alongside the survivors */
+        if (include_best && cnt) ++cnt;
+        if (!cnt) continue;
+
+        unsigned int pos;
+        if (lane == 0) pos = atomicAdd(count, (unsigned int)cnt);
+        pos = __shfl_sync(FULL, pos, 0);
+
+        if constexpr (IPT > 0) {
+#pragma unroll
+            for (int t = 0; t < IPT; ++t) {
+                if (mm[t] & (1u << lane)) {
+                    const unsigned int slot =
+                        pos + __popc(mm[t] & ((1u << lane) - 1u));
+                    if (slot < (unsigned int)cap)
+                        list[slot] = i * k + (lane + t * WARP);
+                }
+                pos += __popc(mm[t]);
+            }
+        } else {
+            /* second look at the row, straight out of L1 */
+            for (int c0 = 0; c0 < k; c0 += WARP) {
+                const int j = c0 + lane;
+                const bool keep = (j < k && j != jb) &&
+                    survives<C3, C6>(g[j], cnorm2[j], t0, factor, slack);
+                const unsigned int m = __ballot_sync(FULL, keep);
+                if (keep) {
+                    const unsigned int slot =
+                        pos + __popc(m & ((1u << lane) - 1u));
+                    if (slot < (unsigned int)cap) list[slot] = i * k + j;
+                }
+                pos += __popc(m);
+            }
+        }
+        if (include_best && lane == 0 && pos < (unsigned int)cap)
+            list[pos] = i * k + jb;
     }
 
     if constexpr (CASCADE) if (ref_count) {
@@ -401,110 +470,51 @@ __global__ void k_row_argmin_32(const float* __restrict__ G,
     if (lane == 0) assign[i] = r.j;
 }
 
-/* ------------------------------------------------- CSR fill (condition) --- */
+/* ------------------------------------------------------ the condition ----- */
 
-/* The second half of the exclusion test: with row_nnz scanned into row_ptr,
- * re-apply the predicate and write the survivor pattern.  Only the rows that
- * actually have survivors are touched, which is a small fraction of them. */
-template <bool C3, bool C6>
-__global__ void k_condition_fill(const float* __restrict__ G,
-                                 const float* __restrict__ cnorm2,
-                                 const int* __restrict__ jbest,
-                                 const float* __restrict__ dbest,
-                                 const float* __restrict__ gbest,
-                                 const float* __restrict__ gexact,
-                                 int n, int k,
-                                 float factor, float gfac, float slack,
-                                 const int* __restrict__ row_ptr,
-                                 int* __restrict__ col,
-                                 int* __restrict__ rowidx, int include_best) {
+/* Enumerate the flat indices i*k + j that survive the exclusion test.
+ *
+ * There is no CSR, no scan and no per-row structure: survivors go into one
+ * flat append-only list.  The only thing that needs care is the append itself.
+ * One atomicAdd per warp per row-chunk would put hundreds of thousands of
+ * serialised atomics on a single counter, so slots are reserved once per block
+ * per row-batch: each warp records its own chunk masks, the block sums the
+ * per-warp counts, one thread claims the whole block's range, and the warps
+ * then write into it with an intra-warp prefix from the same masks.  The masks
+ * live in dynamic shared memory (ceil(k/32) words per warp), so the row is
+ * tested once and read once. */
+/* ------------------------------------------------ high precision update --- */
+
+/* One warp per surviving flat index: recover (i, j), take the FP32 inner
+ * product, and reduce it straight into that row's packed best.  No values are
+ * stored and there is no separate selection pass. */
+__global__ void k_update_flat(const float* __restrict__ P,
+                              const float* __restrict__ C,
+                              const float* __restrict__ cnorm2,
+                              const int* __restrict__ list, int nnz,
+                              int k, int d,
+                              unsigned long long* __restrict__ bestpack) {
     const int lane = threadIdx.x & (WARP - 1);
     const int step = gridDim.x * WPB;
-
-    for (int i = blockIdx.x * WPB + (threadIdx.x >> 5); i < n; i += step) {
-        int base = row_ptr[i];
-        if (base == row_ptr[i + 1]) continue;      /* nothing survived here */
-
-        const int   jb = jbest[i];
-        const RowTest t = row_test(jb, dbest[i], gbest[i],
-                                   C6 ? gexact[i] : 0.f, cnorm2[jb],
-                                   gfac, slack, C3, C6);
-
-        if (include_best) {
-            if (lane == 0) {
-                col[base]    = jb;   /* (6) produced no value for the incumbent,
-                                      * so it is refined with the survivors */
-                rowidx[base] = i;
-            }
-            base += 1;
-        }
-
-        const float* g = G + (size_t)i * k;
-        for (int c0 = 0; c0 < k; c0 += WARP) {
-            const int j = c0 + lane;
-            bool keep = false;
-            if (j < k && j != jb)
-                keep = survives<C3, C6>(g[j], cnorm2[j], t, factor, slack);
-            const unsigned mk = __ballot_sync(FULL, keep);
-            if (keep) {
-                const int e = base + __popc(mk & ((1u << lane) - 1u));
-                col[e]    = j;
-                rowidx[e] = i;
-            }
-            base += __popc(mk);
-        }
+    for (int e = blockIdx.x * WPB + (threadIdx.x >> 5); e < nnz; e += step) {
+        const int idx = list[e];
+        const int i   = idx / k;
+        const int j   = idx - i * k;
+        const float* p = P + (size_t)i * d;
+        const float* c = C + (size_t)j * d;
+        float acc = 0.f;
+        for (int t = lane; t < d; t += WARP) acc = fmaf(p[t], c[t], acc);
+        const float dot = warp_sum(acc);
+        if (lane == 0)
+            atomicMin(&bestpack[i], mpk_pack(fmaf(-2.f, dot, cnorm2[j]), j));
     }
 }
 
-/* ------------------------------------------------------ update kernel ---- */
-
-/* One warp per surviving entry: the FP32 inner product cusparseSDDMM would
- * have computed.  Cheaper than SDDMM when the survivor count is small, since
- * SDDMM pays for descriptors, a bufferSize query and a preprocess pass every
- * iteration (the pattern changes every iteration). */
-__global__ void k_update(const float* __restrict__ P, const float* __restrict__ C,
-                         const int* __restrict__ col,
-                         const int* __restrict__ rowidx,
-                         int nnz, int d, float* __restrict__ val) {
-    const int lane = threadIdx.x & (WARP - 1);
-    const int e    = blockIdx.x * WPB + (threadIdx.x >> 5);
-    if (e >= nnz) return;
-    const float* p = P + (size_t)rowidx[e] * d;
-    const float* c = C + (size_t)col[e]    * d;
-    float acc = 0.f;
-    for (int t = lane; t < d; t += WARP) acc = fmaf(p[t], c[t], acc);
-    const float s = warp_sum(acc);
-    if (lane == 0) val[e] = s;
-}
-
-/* ------------------------------------------------------ final argmin ----- */
-
-/* One THREAD per row, not one warp: survivor rows hold a handful of entries
- * and the overwhelming majority hold none, so a warp per row left 31 of 32
- * lanes idle and needed 32x the blocks. */
-__global__ void k_final_assign(const int* __restrict__ row_ptr,
-                               const int* __restrict__ col,
-                               const float* __restrict__ val,
-                               const float* __restrict__ cnorm2,
-                               const int* __restrict__ jbest,
-                               const float* __restrict__ gexact,
-                               int n, int* __restrict__ assign) {
+/* The label is just the low half of the packed best. */
+__global__ void k_unpack(const unsigned long long* __restrict__ bestpack,
+                         int n, int* __restrict__ assign) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-
-    const int jb = jbest[i];
-    const int b = row_ptr[i], e = row_ptr[i + 1];
-    if (b == e) { assign[i] = jb; return; }   /* proved optimal outright */
-
-    /* With (6) on, the incumbent's high precision distance came from the
-     * argmin kernel's dot; with (3) alone it sits in the row itself. */
-    ArgMin mine = gexact ? ArgMin{fmaf(-2.f, gexact[i], cnorm2[jb]), jb}
-                         : ArgMin{INFINITY, jb};
-    for (int t = b; t < e; ++t) {
-        const int j = col[t];
-        mine = amin(mine, ArgMin{fmaf(-2.f, val[t], cnorm2[j]), j});
-    }
-    assign[i] = mine.j;
+    if (i < n) assign[i] = (int)(bestpack[i] & 0xffffffffull);
 }
 
 /* -------------------------------------------------------- verification --- */
@@ -521,38 +531,50 @@ __global__ void k_final_assign(const int* __restrict__ row_ptr,
  *   n_label_diff     it was reachable but the mixed run did not pick it.
  *   excess           what that cost, in the FP32 distances themselves.
  */
-__global__ void k_verify_ref(const float* __restrict__ G32,
+/* Reachability is now checked by re-evaluating the predicate rather than by
+ * searching a survivor list: the flat list holds exactly the pairs for which
+ * survives<C3,C6>() is true, so asking the test again about (i, r) answers
+ * "was r in the list" exactly, without the list being sorted or indexed. */
+template <bool C3, bool C6>
+__global__ void k_verify_ref(const float* __restrict__ G,
+                             const float* __restrict__ G32,
                              const float* __restrict__ cnorm2,
-                             const int* __restrict__ row_ptr,
-                             const int* __restrict__ col,
                              const int* __restrict__ jbest,
+                             const float* __restrict__ dbest,
+                             const float* __restrict__ gbest,
+                             const float* __restrict__ gexact,
                              const int* __restrict__ assign,
                              const int* __restrict__ ref,
-                             int n, int k,
+                             int n, int k, float factor, float gfac, float slack,
                              unsigned long long* __restrict__ n_excluded_best,
                              unsigned long long* __restrict__ n_label_diff,
                              double* __restrict__ excess) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
-    const int r = ref[i];
-    const int a = assign[i];
+    const int r  = ref[i];
+    const int a  = assign[i];
+    const int jb = jbest[i];
 
-    bool survived = (r == jbest[i]);
-    if (!survived) {
-        for (int t = row_ptr[i]; t < row_ptr[i + 1]; ++t)
-            if (col[t] == r) { survived = true; break; }
+    bool reachable = (r == jb);
+    if (!reachable) {
+        const RowTest t0 = row_test(jb, dbest[i], gbest[i],
+                                    C6 ? gexact[i] : 0.f,
+                                    C6 ? cnorm2[jb] : 0.f,
+                                    gfac, slack, C3, C6);
+        reachable = survives<C3, C6>(G[(size_t)i * k + r], cnorm2[r], t0,
+                                     factor, slack);
     }
-    if (!survived) atomicAdd(n_excluded_best, 1ull);
+    if (!reachable) atomicAdd(n_excluded_best, 1ull);
 
     if (a != r) {
         atomicAdd(n_label_diff, 1ull);
         const float* g = G32 + (size_t)i * k;
-        const float da = fmaf(-2.f, g[a], cnorm2[a]);
-        const float dr = fmaf(-2.f, g[r], cnorm2[r]);
-        atomicAdd(excess, (double)da - (double)dr);
+        atomicAdd(excess, (double)fmaf(-2.f, g[a], cnorm2[a])
+                        - (double)fmaf(-2.f, g[r], cnorm2[r]));
     }
 }
+
 #endif /* MPK_STATS */
 
 /* ---------------------------------------------------------- bookkeeping -- */
@@ -659,7 +681,8 @@ void mpkLaunchArgminCount(const float* G, const float* cnorm2, const float* dP,
                           float factor, float gfac, float slack,
                           int use_cond3, int use_cond6, int cascade,
                           int* jbest, float* dbest, float* gbest, float* gexact,
-                          int* row_nnz, int include_best,
+                          unsigned long long* bestpack, int include_best,
+                          int* list, int cap, unsigned int* count,
                           unsigned long long* ref_count,
                           long long* stat_banks, cudaStream_t s) {
     const int grid = rowgrid(n, 8192);
@@ -667,7 +690,8 @@ void mpkLaunchArgminCount(const float* G, const float* cnorm2, const float* dP,
 #define MPK_ARGMIN_LAUNCH(IPT, REF, C3, C6, CAS)                              \
     k_argmin_count<IPT, REF, C3, C6, CAS><<<grid, NTHR, 0, s>>>(              \
         G, cnorm2, dP, dC, n, d, k, factor, gfac, slack,                      \
-        jbest, dbest, gbest, gexact, row_nnz, include_best, ref_count, b)
+        jbest, dbest, gbest, gexact, bestpack, include_best, list, cap,       \
+        count, ref_count, b)
 #define MPK_ARGMIN_BY_COND(IPT)                                               \
     do {                                                                      \
         if (use_cond3 && use_cond6) {                                         \
@@ -693,40 +717,16 @@ void mpkLaunchRowArgmin32(const float* G32, const float* cnorm2, int n, int k,
     k_row_argmin_32<<<mpk_ceil_div(n, WPB), NTHR, 0, s>>>(G32, cnorm2, n, k, assign);
 }
 
-void mpkLaunchConditionFill(const float* G, const float* cnorm2, const int* jbest,
-                            const float* dbest, const float* gbest,
-                            const float* gexact, int n, int k, float factor,
-                            float gfac, float slack, int use_cond3, int use_cond6,
-                            const int* row_ptr, int* col, int* rowidx,
-                            int include_best, cudaStream_t s) {
-    /* touches only the rows that have survivors, so it wants a small grid */
-    const int grid = rowgrid(n, 2048);
-    if (use_cond3 && use_cond6)
-        k_condition_fill<true, true><<<grid, NTHR, 0, s>>>(
-            G, cnorm2, jbest, dbest, gbest, gexact, n, k, factor, gfac, slack,
-            row_ptr, col, rowidx, include_best);
-    else if (use_cond3)
-        k_condition_fill<true, false><<<grid, NTHR, 0, s>>>(
-            G, cnorm2, jbest, dbest, gbest, gexact, n, k, factor, gfac, slack,
-            row_ptr, col, rowidx, include_best);
-    else
-        k_condition_fill<false, true><<<grid, NTHR, 0, s>>>(
-            G, cnorm2, jbest, dbest, gbest, gexact, n, k, factor, gfac, slack,
-            row_ptr, col, rowidx, include_best);
+void mpkLaunchUpdateFlat(const float* dP, const float* dC, const float* cnorm2,
+                         const int* list, int nnz, int k, int d,
+                         unsigned long long* bestpack, cudaStream_t s) {
+    const int grid = rowgrid(nnz, 8192);
+    k_update_flat<<<grid, NTHR, 0, s>>>(dP, dC, cnorm2, list, nnz, k, d, bestpack);
 }
 
-void mpkLaunchUpdate(const float* dP, const float* dC, const int* col,
-                     const int* rowidx, int nnz, int d, float* val,
+void mpkLaunchUnpack(const unsigned long long* bestpack, int n, int* assign,
                      cudaStream_t s) {
-    k_update<<<mpk_ceil_div(nnz, WPB), NTHR, 0, s>>>(
-        dP, dC, col, rowidx, nnz, d, val);
-}
-
-void mpkLaunchFinalAssign(const int* row_ptr, const int* col, const float* val,
-                          const float* cnorm2, const int* jbest,
-                          const float* gexact, int n, int* assign, cudaStream_t s) {
-    k_final_assign<<<mpk_ceil_div(n, NTHR), NTHR, 0, s>>>(
-        row_ptr, col, val, cnorm2, jbest, gexact, n, assign);
+    k_unpack<<<mpk_ceil_div(n, NTHR), NTHR, 0, s>>>(bestpack, n, assign);
 }
 
 void mpkLaunchCountDiff(const int* a, const int* b, int n, long long* out,
@@ -758,14 +758,23 @@ void mpkLaunchInertia(const float* dP, const float* dC, const int* assign, int n
 }
 
 #ifdef MPK_STATS
-void mpkLaunchVerifyRef(const float* G32, const float* cnorm2,
-                        const int* row_ptr, const int* col, const int* jbest,
-                        const int* assign, const int* ref, int n, int k,
+void mpkLaunchVerifyRef(const float* G, const float* G32, const float* cnorm2,
+                        const int* jbest, const float* dbest, const float* gbest,
+                        const float* gexact, const int* assign, const int* ref,
+                        int n, int k, float factor, float gfac, float slack,
+                        int use_cond3, int use_cond6,
                         long long* n_excluded_best, long long* n_label_diff,
                         double* excess, cudaStream_t s) {
-    k_verify_ref<<<mpk_ceil_div(n, NTHR), NTHR, 0, s>>>(
-        G32, cnorm2, row_ptr, col, jbest, assign, ref, n, k,
-        (unsigned long long*)n_excluded_best, (unsigned long long*)n_label_diff,
-        excess);
+    const int grid = mpk_ceil_div(n, NTHR);
+    unsigned long long* eb = (unsigned long long*)n_excluded_best;
+    unsigned long long* ld = (unsigned long long*)n_label_diff;
+#define MPK_VERIFY_LAUNCH(C3, C6)                                             \
+    k_verify_ref<C3, C6><<<grid, NTHR, 0, s>>>(                               \
+        G, G32, cnorm2, jbest, dbest, gbest, gexact, assign, ref, n, k,       \
+        factor, gfac, slack, eb, ld, excess)
+    if (use_cond3 && use_cond6) MPK_VERIFY_LAUNCH(true, true);
+    else if (use_cond3)         MPK_VERIFY_LAUNCH(true, false);
+    else                        MPK_VERIFY_LAUNCH(false, true);
+#undef MPK_VERIFY_LAUNCH
 }
 #endif

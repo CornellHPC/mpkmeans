@@ -9,9 +9,8 @@
  *   (6) needs one high precision distance per row, computed in the same pass
  *       as the row argmin.
  *
- * The surviving entries are refined either with cusparseSDDMM (when there are
- * many of them) or with a warp-per-entry FP32 inner product (when there are
- * few); see mpkParams::sddmm_min_nnz.
+ * The surviving entries are enumerated as a flat list of i*k + j indices and
+ * refined one warp per entry in FP32.  There is no CSR and no prefix scan.
  *
  * Distances drop the ||p_i||^2 term:
  *
@@ -25,7 +24,6 @@
 #define MPKMEANS_H
 
 #include <cublas_v2.h>
-#include <cusparse.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -40,27 +38,6 @@ typedef enum {
     MPK_ERR_ALLOC = 5
 } mpkStatus;
 
-/* Pass this as sddmm_min_nnz to pick the update path automatically.
- *
- * The crossover between cusparseSDDMM and the warp kernel is set by survivors
- * PER ROW, not by the total, and not by density -- measured on an A100:
- *
- *     n        k     crossover nnz   density   per row
- *     200000   256   ~2.0M            3.9%      10.0
- *     200000    64   ~2.5M           19.5%      12.5
- *     400000   256   ~3.9M            3.8%       9.7
- *
- * SDDMM tiles a row and reuses the loaded row of P across that row's entries,
- * so the reuse it wins is exactly the entries-per-row.  The crossover also
- * drifts with d (<4.7 per row at d=32, ~10 at d=128, >14.5 at d=512), which
- * MPK_SDDMM_PER_ROW models as 10*sqrt(d/128).
- *
- * Note this regime is far from where the scheme is normally used: with
- * separated clusters the survivor count is ~0.1-0.5 per row, orders of
- * magnitude below the crossover, so the warp kernel is essentially always the
- * right choice.  The threshold only matters for heavily overlapping data. */
-#define MPK_SDDMM_AUTO (-1)
-
 typedef struct {
     int   max_iter;       /* default 100                                      */
     float tol;            /* stop when max centroid movement^2 < tol; def. 0   */
@@ -74,10 +51,6 @@ typedef struct {
                            * actually costs.  Exclusions are identical to the
                            * unconditional (3)+(6); only the work differs.
                            * Ignored unless both conditions are on.  default 0 */
-    int   sddmm_min_nnz;  /* survivors needed before cusparseSDDMM is used
-                           * instead of the warp kernel.  MPK_SDDMM_AUTO (the
-                           * default) derives it from n and d; 0 forces SDDMM,
-                           * a huge value forces the warp kernel.              */
     int   verify;         /* per-iteration FP64 oracle check (MPK_STATS only)  */
     int   verbose;        /* per-iteration log to stdout                       */
 } mpkParams;
@@ -98,7 +71,7 @@ typedef struct {
     long long hp_baseline;    /* n*k per iteration                             */
     long long hp_reference;   /* reference entries actually evaluated: n per
                                * iteration for (6), fewer under the cascade    */
-    long long hp_update;      /* survivors refined by SDDMM or the fallback    */
+    long long hp_update;      /* survivors refined in FP32                     */
 
     /* --- attribution of the exclusions, over the n*(k-1) tested pairs ------
      * Only filled when the library was built with MPK_STATS.                 */
@@ -118,8 +91,6 @@ typedef struct {
     double    verify_excess;        /* sum of D64(assigned) - D64(best)         */
 
     int stats_built;          /* 1 if built with MPK_STATS                     */
-    int iters_sddmm;          /* iterations that took the cusparseSDDMM path   */
-    int iters_fallback;       /* iterations that took the warp fallback        */
 
     /* Timings.  t_dist_ms is the headline: everything except the centroid
      * update, which is identical in both algorithms and deliberately left
@@ -129,9 +100,7 @@ typedef struct {
     double t_prep_ms;         /* C -> FP16, ||c_j||^2                          */
     double t_gemm_lo_ms;      /* FP16 P*C^T (FP32 SGEMM for the reference)     */
     double t_argmin_ms;       /* row argmin, plus the (6) reference entry      */
-    double t_filter_ms;       /* conditions (3)/(6) + CSR build                */
-    double t_sddmm_setup_ms;  /* SDDMM descriptors + bufferSize + preprocess   */
-    double t_hp_update_ms;    /* SDDMM or fallback on the survivors            */
+    double t_hp_update_ms;    /* FP32 inner products on the survivors          */
     double t_assign_ms;       /* final argmin                                  */
     double t_update_ms;       /* centroid recomputation (excluded from t_dist) */
 } mpkStats;
@@ -157,7 +126,7 @@ mpkStatus mpkShiftNonNegative(float* dP, int n, int d, float* out_shift);
  *   dAssign   n,     device, out
  *
  * dP is not modified. */
-mpkStatus mpkMeansMixed(cublasHandle_t blas, cusparseHandle_t sparse,
+mpkStatus mpkMeansMixed(cublasHandle_t blas,
                         const float* dP, int n, int d, int k,
                         float* dC, int* dAssign,
                         const mpkParams* params, mpkStats* stats);

@@ -7,7 +7,7 @@
  *      the high precision reference entry gexact[i] = fl32(<p_i, c_jbest[i]>);
  *      and the conditions (3)/(6) of Theorem 1  -> a survivor count per row
  *   4. scan the counts, then write the CSR survivor pattern
- *   5. the survivors are refined in FP32, by cusparseSDDMM if there are many
+ *   5. the survivors are refined in FP32, one warp per surviving flat index
  *      of them and by a warp-per-entry inner product if there are few
  *   6. argmin over survivors and jbest             -> assignment
  *   7. centroid recomputation (FP64 accumulation, FP32 result)
@@ -90,7 +90,6 @@ extern "C" void mpkParamsInit(mpkParams* p) {
     p->use_cond3     = 1;
     p->use_cond6     = 1;
     p->cascade       = 0;
-    p->sddmm_min_nnz = MPK_SDDMM_AUTO;
     p->verify        = 0;
     p->verbose       = 0;
 }
@@ -254,7 +253,7 @@ done:
 
 /* -------------------------------------------------------------- mixed ---- */
 
-extern "C" mpkStatus mpkMeansMixed(cublasHandle_t blas, cusparseHandle_t sparse,
+extern "C" mpkStatus mpkMeansMixed(cublasHandle_t blas,
                                    const float* dP, int n, int d, int k,
                                    float* dC, int* dAssign,
                                    const mpkParams* params, mpkStats* stats) {
@@ -295,27 +294,16 @@ extern "C" mpkStatus mpkMeansMixed(cublasHandle_t blas, cusparseHandle_t sparse,
     const double gs = gs_raw / (1.0 - gs_raw);
     const float gfac = (float)(2.0 * gs / (1.0 - gs));
 
-    /* Resolve the update-path crossover.  It tracks survivors per row rather
-     * than the total (SDDMM's win is the reuse of a row of P across that row's
-     * entries), and drifts with d; see MPK_SDDMM_AUTO.  The fit is from three
-     * (n,k) points and three d points, so it is a coarse guide, but near the
-     * crossover the two paths are within ~10% of each other by definition. */
-    long long sddmm_min = P.sddmm_min_nnz;
-    if (P.sddmm_min_nnz < 0) {
-        double per_row = 10.0 * sqrt((double)d / 128.0);
-        if (per_row <  4.0) per_row =  4.0;
-        if (per_row > 24.0) per_row = 24.0;
-        sddmm_min = (long long)(per_row * (double)n);
-    }
 
     cudaStream_t s = nullptr;
     cublasGetStream(blas, &s);
-    cusparseSetStream(sparse, s);
 
     __half *P16 = nullptr, *C16 = nullptr;
     float  *G = nullptr, *cnorm2 = nullptr, *moved2 = nullptr;
     float  *dbest = nullptr, *gbest = nullptr, *gexact = nullptr;
-    int    *jbest = nullptr, *row_nnz = nullptr, *row_ptr = nullptr, *prev = nullptr;
+    int    *jbest = nullptr, *prev = nullptr;
+    unsigned long long *bestpack = nullptr;  /* per row (distance, index) key */
+    unsigned int       *dNnz = nullptr;      /* survivor list length          */
     unsigned long long *dRefCnt = nullptr;  /* rows that evaluated a (6)
                                             * reference entry, over the run */
 #ifdef MPK_STATS
@@ -340,11 +328,9 @@ extern "C" mpkStatus mpkMeansMixed(cublasHandle_t blas, cusparseHandle_t sparse,
     int*       h_nnz = nullptr;
     long long* h_changed = nullptr;
 
-    void*  scan_tmp = nullptr; size_t scan_cap = 0, scan_bytes = 0;
-    void*  col_buf  = nullptr; size_t col_cap = 0;
-    void*  row_buf  = nullptr; size_t row_cap = 0;
-    void*  val_buf  = nullptr; size_t val_cap = 0;
-    void*  sddmm_buf = nullptr; size_t sddmm_cap = 0;
+    /* the one survivor buffer: a flat list of i*k + j */
+    void*  list_buf = nullptr; size_t list_cap = 0, list_cap_entries = 0;
+    double t_argmin_keep = 0.0;
 
     mpkStatus st = MPK_OK;
 #define ALLOC(p, bytes) if (cudaMalloc((void**)&(p), (bytes)) != cudaSuccess) { st = MPK_ERR_ALLOC; goto done; }
@@ -363,10 +349,10 @@ extern "C" mpkStatus mpkMeansMixed(cublasHandle_t blas, cusparseHandle_t sparse,
         ALLOC(dARef, (size_t)n * sizeof(int));
     }
 #endif
-    ALLOC(jbest,   (size_t)n * sizeof(int));
-    ALLOC(row_nnz, (size_t)n * sizeof(int));
-    ALLOC(row_ptr, (size_t)(n + 1) * sizeof(int));
-    ALLOC(prev,    (size_t)n * sizeof(int));
+    ALLOC(jbest,    (size_t)n * sizeof(int));
+    ALLOC(bestpack, (size_t)n * sizeof(unsigned long long));
+    ALLOC(dNnz,     sizeof(unsigned int));
+    ALLOC(prev,     (size_t)n * sizeof(int));
     ALLOC(sums,   (size_t)k * d * sizeof(double));
     ALLOC(counts, (size_t)k * sizeof(int));
     ALLOC(dInertia, sizeof(double));
@@ -381,18 +367,13 @@ extern "C" mpkStatus mpkMeansMixed(cublasHandle_t blas, cusparseHandle_t sparse,
         cudaHostAlloc((void**)&h_changed, sizeof(long long), cudaHostAllocDefault)
             != cudaSuccess) { st = MPK_ERR_ALLOC; goto done; }
 
-    cub::DeviceScan::InclusiveSum(nullptr, scan_bytes, row_nnz, row_ptr + 1, n, s);
-    if (grow(&scan_tmp, &scan_cap, scan_bytes) != cudaSuccess) { st = MPK_ERR_ALLOC; goto done; }
-
-    /* Size the survivor buffers for one entry per row up front.  cudaMalloc
-     * costs milliseconds and grow() would otherwise call it from inside a
-     * timed iteration -- the first iteration always has the most survivors,
-     * so whichever configuration ran first was charged for the allocation. */
-    if (grow(&col_buf, &col_cap, (size_t)n * sizeof(int))   != cudaSuccess ||
-        grow(&row_buf, &row_cap, (size_t)n * sizeof(int))   != cudaSuccess ||
-        grow(&val_buf, &val_cap, (size_t)n * sizeof(float)) != cudaSuccess) {
+    /* Size the survivor list for two entries per row up front.  cudaMalloc
+     * costs milliseconds, so growing it from inside a timed iteration would
+     * charge whichever configuration ran first for the allocation. */
+    if (grow(&list_buf, &list_cap, (size_t)2 * n * sizeof(int)) != cudaSuccess) {
         st = MPK_ERR_ALLOC; goto done;
     }
+    list_cap_entries = list_cap / sizeof(int);
 
     cudaMemset(prev, 0xff, (size_t)n * sizeof(int));
     cudaMemset(dCnt, 0, 3 * sizeof(long long));
@@ -401,13 +382,12 @@ extern "C" mpkStatus mpkMeansMixed(cublasHandle_t blas, cusparseHandle_t sparse,
     cudaMemset(dStatBanks, 0, 3 * MPK_STAT_BANKS * sizeof(long long));
 #endif
     if (dExcess) cudaMemset(dExcess, 0, sizeof(double));
-    cudaMemset(row_ptr, 0, sizeof(int));
 
     /* P is fixed: convert once. */
     mpkLaunchToHalf(dP, P16, (long long)n * d, s);
 
     {
-        Timer tt, t0, t1, t3, t4, t5, t6, t7, t8, t9;
+        Timer tt, t0, t1, t4, t5, t7;
         tt.start(s);
         cublasSetMathMode(blas, CUBLAS_DEFAULT_MATH);
         const float f_one = 1.f, f_zero = 0.f;
@@ -431,117 +411,65 @@ extern "C" mpkStatus mpkMeansMixed(cublasHandle_t blas, cusparseHandle_t sparse,
             }
             t1.stop(s, &stats->t_gemm_lo_ms);
 
-            /* ---- 3: row argmin, the (6) reference entry and the exclusion
-             * test, all in one pass over the row of G ---------------------- */
-            t7.start(s);
-            mpkLaunchArgminCount(G, cnorm2, dP, dC, n, d, k, factor, gfac, SLACK,
-                                 P.use_cond3, P.use_cond6, cascade_on,
-                                 jbest, dbest, gbest,
-                                 gexact, row_nnz, include_best, dRefCnt,
-                                 dStatBanks, s);
-            t7.stop(s, &stats->t_argmin_ms);
-
-            /* ---- 4: scan the counts into row_ptr and write the pattern --- */
-            t3.start(s);
-            cub::DeviceScan::InclusiveSum(scan_tmp, scan_bytes, row_nnz,
-                                          row_ptr + 1, n, s);
-            cudaMemcpyAsync(h_nnz, row_ptr + n, sizeof(int),
-                            cudaMemcpyDeviceToHost, s);
-            cudaStreamSynchronize(s);
-            const int nnz = *h_nnz;
-
-            t3.stop(s, &stats->t_filter_ms);
-
-            /* The survivor buffers are resized here, between the two halves of
-             * the filter phase and outside both of them.  cudaFree/cudaMalloc
-             * of tens of megabytes is milliseconds and it synchronises; timed,
-             * it swamps the kernel it is standing next to and does so
-             * unevenly across configurations. */
-            if (nnz > 0) {
-                if (grow(&col_buf, &col_cap, (size_t)nnz * sizeof(int)) != cudaSuccess ||
-                    grow(&row_buf, &row_cap, (size_t)nnz * sizeof(int)) != cudaSuccess ||
-                    grow(&val_buf, &val_cap, (size_t)nnz * sizeof(float)) != cudaSuccess) {
-                    st = MPK_ERR_ALLOC; goto done;
-                }
-                t8.start(s);
-                mpkLaunchConditionFill(G, cnorm2, jbest, dbest, gbest, gexact, n, k,
-                                       factor, gfac, SLACK, P.use_cond3,
-                                       P.use_cond6, row_ptr, (int*)col_buf,
-                                       (int*)row_buf, include_best, s);
-                t8.stop(s, &stats->t_filter_ms);
+            /* ---- 3/4: row argmin, the (6) reference entry, the exclusion
+             * test and the survivor list, all in one pass over the row ------
+             * The survivors go into one flat append-only list of i*k + j.
+             * There is no CSR and no scan; the count comes back from a device
+             * counter, and if the list did not fit the buffer is grown and the
+             * pass repeated, which happens once or twice per run at most. */
+            int nnz = 0;
+            for (;;) {
+                cudaMemsetAsync(dNnz, 0, sizeof(unsigned int), s);
+                t7.start(s);
+                mpkLaunchArgminCount(G, cnorm2, dP, dC, n, d, k, factor, gfac,
+                                     SLACK, P.use_cond3, P.use_cond6, cascade_on,
+                                     jbest, dbest, gbest, gexact, bestpack,
+                                     include_best, (int*)list_buf,
+                                     (int)list_cap_entries, dNnz, dRefCnt,
+                                     dStatBanks, s);
+                t7.stop(s, &stats->t_argmin_ms);
+                cudaMemcpyAsync(h_nnz, dNnz, sizeof(unsigned int),
+                                cudaMemcpyDeviceToHost, s);
+                cudaStreamSynchronize(s);
+                nnz = (int)*(unsigned int*)h_nnz;
+                if ((size_t)nnz <= list_cap_entries) break;
+                /* the overflowing pass is discarded, and not charged for */
+                t7.collect();
+                stats->t_argmin_ms = t_argmin_keep;
+                if (dRefCnt) cudaMemset(dRefCnt, 0, sizeof(unsigned long long));
+#ifdef MPK_STATS
+                cudaMemset(dStatBanks, 0, 3 * MPK_STAT_BANKS * sizeof(long long));
+#endif
+                if (grow(&list_buf, &list_cap, (size_t)nnz * sizeof(int))
+                    != cudaSuccess) { st = MPK_ERR_ALLOC; goto done; }
+                list_cap_entries = list_cap / sizeof(int);
             }
+            t7.collect();
+            t_argmin_keep = stats->t_argmin_ms;
+
+            /* ---- 5: the high precision entries --------------------------- */
+            if (nnz > 0) {
+                t4.start(s);
+                mpkLaunchUpdateFlat(dP, dC, cnorm2, (const int*)list_buf, nnz,
+                                    k, d, bestpack, s);
+                t4.stop(s, &stats->t_hp_update_ms);
+            }
+
+            /* ---- 6: the label is the low half of the packed best --------- */
+            t5.start(s);
+            mpkLaunchUnpack(bestpack, n, dAssign, s);
+            t5.stop(s, &stats->t_assign_ms);
 
             stats->tested       += (long long)n * (k - 1);
             stats->hp_baseline  += (long long)n * k;
-            /* hp_reference accumulates in dRefCnt on the device and is read
-             * once after the loop: a per-iteration read would cost a host
-             * synchronisation for a number nothing in the loop consumes */
             stats->hp_update    += nnz;
-            if (stats->n_hist < MPK_MAX_HIST)
-                stats->hist_survivors[stats->n_hist++] = nnz;
-
-            /* ---- 5: high precision refinement of the survivors ----------- */
-            if (nnz > 0 && (long long)nnz >= sddmm_min) {
-                stats->iters_sddmm++;
-                t6.start(s);
-                cusparseConstDnMatDescr_t mA = nullptr, mB = nullptr;
-                cusparseSpMatDescr_t      mC = nullptr;
-                /* A: P, n x d, row major.  B: C^T, d x k -- the k x d row major
-                 * buffer dC read as column major with ld = d is exactly C^T. */
-                MPK_SPARSE(cusparseCreateConstDnMat(&mA, n, d, d, dP,
-                                                    CUDA_R_32F, CUSPARSE_ORDER_ROW));
-                MPK_SPARSE(cusparseCreateConstDnMat(&mB, d, k, d, dC,
-                                                    CUDA_R_32F, CUSPARSE_ORDER_COL));
-                MPK_SPARSE(cusparseCreateCsr(&mC, n, k, nnz, row_ptr, col_buf,
-                                             val_buf, CUSPARSE_INDEX_32I,
-                                             CUSPARSE_INDEX_32I,
-                                             CUSPARSE_INDEX_BASE_ZERO, CUDA_R_32F));
-                size_t need = 0;
-                MPK_SPARSE(cusparseSDDMM_bufferSize(
-                    sparse, CUSPARSE_OPERATION_NON_TRANSPOSE,
-                    CUSPARSE_OPERATION_NON_TRANSPOSE, &f_one, mA, mB, &f_zero, mC,
-                    CUDA_R_32F, CUSPARSE_SDDMM_ALG_DEFAULT, &need));
-                t6.stop(s, &stats->t_sddmm_setup_ms);
-                if (grow(&sddmm_buf, &sddmm_cap, need ? need : 1) != cudaSuccess) {
-                    st = MPK_ERR_ALLOC; goto done;
-                }
-                t9.start(s);
-                MPK_SPARSE(cusparseSDDMM_preprocess(
-                    sparse, CUSPARSE_OPERATION_NON_TRANSPOSE,
-                    CUSPARSE_OPERATION_NON_TRANSPOSE, &f_one, mA, mB, &f_zero, mC,
-                    CUDA_R_32F, CUSPARSE_SDDMM_ALG_DEFAULT, sddmm_buf));
-                t9.stop(s, &stats->t_sddmm_setup_ms);
-                t4.start(s);
-                MPK_SPARSE(cusparseSDDMM(
-                    sparse, CUSPARSE_OPERATION_NON_TRANSPOSE,
-                    CUSPARSE_OPERATION_NON_TRANSPOSE, &f_one, mA, mB, &f_zero, mC,
-                    CUDA_R_32F, CUSPARSE_SDDMM_ALG_DEFAULT, sddmm_buf));
-                cusparseDestroyDnMat(mA);
-                cusparseDestroyDnMat(mB);
-                cusparseDestroySpMat(mC);
-                t4.stop(s, &stats->t_hp_update_ms);
-            } else if (nnz > 0) {
-                stats->iters_fallback++;
-                t4.start(s);
-                mpkLaunchUpdate(dP, dC, (const int*)col_buf, (const int*)row_buf,
-                                nnz, d, (float*)val_buf, s);
-                t4.stop(s, &stats->t_hp_update_ms);
-            }
-
-            /* ---- 6: final assignment ------------------------------------- */
-            t5.start(s);
-            mpkLaunchFinalAssign(row_ptr, (const int*)col_buf,
-                                 (const float*)val_buf, cnorm2, jbest, gexact,
-                                 n, dAssign, s);
-            t5.stop(s, &stats->t_assign_ms);
 
 #ifdef MPK_STATS
             /* ---- oracle check: the plain FP32 iteration, same centroids ---
              * Untimed, and deliberately the real thing -- cublasSgemm under
              * PEDANTIC math, exactly as mpkMeansFP32 runs it, so `dARef` is
              * the label the reference implementation would have produced from
-             * this same dC.  Anything the bounds excluded that the reference
-             * then picks is a genuine violation. */
+             * this same dC. */
             if (P.verify) {
                 cublasMath_t vm;
                 cublasGetMathMode(blas, &vm);
@@ -552,8 +480,9 @@ extern "C" mpkStatus mpkMeansMixed(cublasHandle_t blas, cusparseHandle_t sparse,
                     != CUBLAS_STATUS_SUCCESS) { st = MPK_ERR_CUBLAS; goto done; }
                 cublasSetMathMode(blas, vm);
                 mpkLaunchRowArgmin32(G32, cnorm2, n, k, dARef, s);
-                mpkLaunchVerifyRef(G32, cnorm2, row_ptr, (const int*)col_buf,
-                                   jbest, dAssign, dARef, n, k,
+                mpkLaunchVerifyRef(G, G32, cnorm2, jbest, dbest, gbest, gexact,
+                                   dAssign, dARef, n, k, factor, gfac, SLACK,
+                                   P.use_cond3, P.use_cond6,
                                    dCnt + 1, dCnt + 2, dExcess, s);
             }
 #endif
@@ -568,9 +497,7 @@ extern "C" mpkStatus mpkMeansMixed(cublasHandle_t blas, cusparseHandle_t sparse,
             cudaMemcpyAsync(prev, dAssign, (size_t)n * sizeof(int),
                             cudaMemcpyDeviceToDevice, s);
 
-            t0.collect(); t1.collect(); t7.collect();
-            t3.collect(); t8.collect(); t6.collect(); t9.collect();
-            t4.collect(); t5.collect();
+            t0.collect(); t1.collect(); t4.collect(); t5.collect();
 
             stats->iters = it + 1;
             if (P.verbose)
@@ -600,8 +527,7 @@ extern "C" mpkStatus mpkMeansMixed(cublasHandle_t blas, cusparseHandle_t sparse,
         tt.stop_sync(s, &stats->t_total_ms);
     }
     stats->t_dist_ms = stats->t_prep_ms + stats->t_gemm_lo_ms +
-                       stats->t_argmin_ms + stats->t_filter_ms +
-                       stats->t_sddmm_setup_ms + stats->t_hp_update_ms +
+                       stats->t_argmin_ms + stats->t_hp_update_ms +
                        stats->t_assign_ms;
 
     /* the reference entries actually evaluated, accumulated on the device over
@@ -642,15 +568,15 @@ done:
     cublasSetMathMode(blas, CUBLAS_DEFAULT_MATH);
     cudaFree(P16); cudaFree(C16); cudaFree(G);
     cudaFree(cnorm2); cudaFree(moved2); cudaFree(dbest); cudaFree(gbest);
-    cudaFree(gexact); cudaFree(dRefCnt); cudaFree(jbest); cudaFree(row_nnz);
+    cudaFree(gexact); cudaFree(dRefCnt); cudaFree(jbest);
+    cudaFree(bestpack); cudaFree(dNnz);
 #ifdef MPK_STATS
     cudaFree(G32); cudaFree(dARef);
 #endif
-    cudaFree(row_ptr); cudaFree(prev); cudaFree(sums); cudaFree(counts);
+    cudaFree(prev); cudaFree(sums); cudaFree(counts);
     cudaFree(dInertia); cudaFree(dCnt); cudaFree(dStatBanks);
     cudaFree(dExcess);
     cudaFreeHost(h_nnz); cudaFreeHost(h_changed);
-    cudaFree(scan_tmp); cudaFree(col_buf); cudaFree(row_buf); cudaFree(val_buf);
-    cudaFree(sddmm_buf);
+    cudaFree(list_buf);
     return st;
 }

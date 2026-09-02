@@ -2,7 +2,6 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
-#include <cusparse.h>
 #include <cstdio>
 #include "mpkmeans/mpkmeans.h"
 
@@ -22,16 +21,6 @@
         if (s_ != CUBLAS_STATUS_SUCCESS) {                                    \
             fprintf(stderr, "%s:%d cuBLAS: %d\n", __FILE__, __LINE__, (int)s_);\
             return MPK_ERR_CUBLAS;                                            \
-        }                                                                     \
-    } while (0)
-
-#define MPK_SPARSE(call)                                                      \
-    do {                                                                      \
-        cusparseStatus_t s_ = (call);                                         \
-        if (s_ != CUSPARSE_STATUS_SUCCESS) {                                  \
-            fprintf(stderr, "%s:%d cuSPARSE: %s\n", __FILE__, __LINE__,       \
-                    cusparseGetErrorString(s_));                              \
-            return MPK_ERR_CUSPARSE;                                          \
         }                                                                     \
     } while (0)
 
@@ -113,7 +102,8 @@ void mpkLaunchArgminCount(const float* G, const float* cnorm2, const float* dP,
                           float factor, float gfac, float slack,
                           int use_cond3, int use_cond6, int cascade,
                           int* jbest, float* dbest, float* gbest, float* gexact,
-                          int* row_nnz, int include_best,
+                          unsigned long long* bestpack, int include_best,
+                          int* list, int cap, unsigned int* count,
                           unsigned long long* ref_count,
                           long long* stat_banks,
                           cudaStream_t s);
@@ -122,20 +112,12 @@ void mpkLaunchArgminCount(const float* G, const float* cnorm2, const float* dP,
  * the same predicate and write the CSR survivor pattern (col) plus the row
  * index of each entry (rowidx, which the update kernel needs).  Touches only
  * the rows that have survivors. */
-void mpkLaunchConditionFill(const float* G, const float* cnorm2,
-                            const int* jbest, const float* dbest,
-                            const float* gbest, const float* gexact,
-                            int n, int k,
-                            float factor, float gfac, float slack,
-                            int use_cond3, int use_cond6,
-                            const int* row_ptr, int* col, int* rowidx,
-                            int include_best, cudaStream_t s);
 
-/* UPDATE KERNEL (the small-nnz alternative to cusparseSDDMM).  One warp per
+/* UPDATE KERNEL.  One warp per
  * surviving entry e:  val[e] = fl32(<P(rowidx[e],:), C(col[e],:)>). */
-void mpkLaunchUpdate(const float* dP, const float* dC, const int* col,
-                     const int* rowidx, int nnz, int d, float* val,
-                     cudaStream_t s);
+void mpkLaunchUpdateFlat(const float* dP, const float* dC, const float* cnorm2,
+                         const int* list, int nnz, int k, int d,
+                         unsigned long long* bestpack, cudaStream_t s);
 
 /* Final assignment: start from (dexact[i], jbest[i]) with
  * dexact[i] = cnorm2[jbest[i]] - 2*gexact[i], and beat it with the refined
@@ -143,10 +125,8 @@ void mpkLaunchUpdate(const float* dP, const float* dC, const int* col,
  * column index.  With gexact NULL the incumbent is instead expected to appear
  * in the row itself (see include_best), and an empty row means jbest[i] was
  * proved optimal. */
-void mpkLaunchFinalAssign(const int* row_ptr, const int* col, const float* val,
-                          const float* cnorm2, const int* jbest,
-                          const float* gexact, int n,
-                          int* assign, cudaStream_t s);
+void mpkLaunchUnpack(const unsigned long long* bestpack, int n, int* assign,
+                     cudaStream_t s);
 
 /* Row-wise argmin of the dense FP32 D(i,j) = cnorm2[j] - 2*G32(i,j). */
 void mpkLaunchRowArgmin32(const float* G32, const float* cnorm2, int n, int k,
@@ -180,9 +160,11 @@ void mpkLaunchInertia(const float* dP, const float* dC, const int* assign,
  *   n_label_diff    += the FP32 label was reachable but not the one picked,
  *   excess          += D32(i, assign[i]) - D32(i, ref[i]).
  * Counters accumulate; the caller zeroes them. */
-void mpkLaunchVerifyRef(const float* G32, const float* cnorm2,
-                        const int* row_ptr, const int* col, const int* jbest,
-                        const int* assign, const int* ref, int n, int k,
+void mpkLaunchVerifyRef(const float* G, const float* G32, const float* cnorm2,
+                        const int* jbest, const float* dbest, const float* gbest,
+                        const float* gexact, const int* assign, const int* ref,
+                        int n, int k, float factor, float gfac, float slack,
+                        int use_cond3, int use_cond6,
                         long long* n_excluded_best, long long* n_label_diff,
                         double* excess, cudaStream_t s);
 #endif

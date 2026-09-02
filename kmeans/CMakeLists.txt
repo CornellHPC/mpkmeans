@@ -36,7 +36,7 @@ target_include_directories(mpkmeans
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 target_link_libraries(mpkmeans
-    PUBLIC CUDA::cudart CUDA::cublas CUDA::cusparse)
+    PUBLIC CUDA::cudart CUDA::cublas)
 
 if(MPK_STATS)
     target_compile_definitions(mpkmeans PUBLIC MPK_STATS)

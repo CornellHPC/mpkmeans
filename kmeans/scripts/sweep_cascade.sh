@@ -9,7 +9,7 @@ for D in 64 128 256; do
   for C in 3 6 36 c; do
     $B -n 200000 -d $D -k 64 -i 20 -r 3 --only $C --no-verify 2>/dev/null |
       awk -v d=$D -v c=$C '/cond +iters +prep +gemm/{f=1;next}
-        f&&/^  \(/{printf "%-5s %-5s %-9s %9.1f %9.1f\n", "200k", d, $1, $5*1000/$2, $10*1000/$2; exit}'
+        f&&/^  \(/{printf "%-5s %-5s %-9s %9.1f %9.1f\n", "200k", d, $1, $5*1000/$2, $8*1000/$2; exit}'
   done
   echo
 done

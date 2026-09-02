@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Sweep the parameters that drive how many high precision distance evaluations
-# the exclusion conditions let us throw out.  Every run carries the FP64 oracle
+# the exclusion conditions let us throw out.  Every run carries the FP32 oracle
 # check, so `violations` in the output must stay 0 throughout.
 #
 # Each invocation emits three rows, one per condition configuration:
 # (3) alone, (6) alone, and (3)+(6).
 set -u
-# Use the MPK_STATS build: the exclusion attribution and the FP64 oracle are
+# Use the MPK_STATS build: the exclusion attribution and the oracle are
 # compiled out of the default build.
 BIN=${BIN:-./build-stats/mpkmeans_bench}
 OUT=${1:-results/sweep.csv}

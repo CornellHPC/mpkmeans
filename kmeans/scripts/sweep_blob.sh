@@ -11,7 +11,7 @@ row() {  # $1 label  $2.. bench args
   local sh=$(echo "$out" | awk '/^shift/{print $5}')
   for C in "(3)" "(6)"; do
     local e=$(echo "$out" | awk -v c="$C" '$1==c && NF==6 && $6 ~ /%$/ {print $4, $6; exit}')
-    local v=$(echo "$out" | awk -v c="$C" '/FP64 oracle/{f=1;next} f&&$1==c{print $2; exit}')
+    local v=$(echo "$out" | awk -v c="$C" '/label != fp32 label/{f=1;next} f&&$1==c{print $2; exit}')
     printf "%-14s %-5s %-9s %12s %11s %8s\n" "$lab" "$sh" "$C" $e "$v"
   done
 }

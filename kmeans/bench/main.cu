@@ -42,10 +42,6 @@ static void usage(const char* p) {
            "  -e <int>       rng seed                   (default 1)\n"
            "  -r <int>       timed repeats, last wins   (default 1)\n"
            "  --only <c>     run one config only: 3, 6, 36 or c (cascade)\n"
-           "  --sddmm-min <n> survivors needed to use cusparseSDDMM\n"
-           "                 (default: auto, from n and d)\n"
-           "  --force-sddmm  always use cusparseSDDMM\n"
-           "  --force-warp   always use the warp fallback update kernel\n"
            "  --no-verify    skip the per-iteration FP64 oracle check\n"
            "                 (the oracle needs a -DMPK_STATS=ON build; it is\n"
            "                  on by default there and absent otherwise)\n"
@@ -100,7 +96,6 @@ int main(int argc, char** argv) {
     int   n = 200000, d = 64, k = 32, max_iter = 50, seed = 1, repeats = 1;
     float blob_std = 1.0f, box = 10.0f;
     int   verify = 1, verbose = 0, csv = 0, only = -1;
-    int   sddmm_min = MPK_SDDMM_AUTO;
 
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
@@ -117,9 +112,6 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "-e")) seed = atoi(next());
         else if (!strcmp(a, "-r")) repeats = atoi(next());
         else if (!strcmp(a, "--no-verify")) verify = 0;
-        else if (!strcmp(a, "--sddmm-min")) sddmm_min = atoi(next());
-        else if (!strcmp(a, "--force-sddmm")) sddmm_min = 0;
-        else if (!strcmp(a, "--force-warp")) sddmm_min = INT32_MAX;
         else if (!strcmp(a, "--only")) {
             const char* v = next();
             only = !strcmp(v, "3") ? 0 : !strcmp(v, "6") ? 1 :
@@ -134,8 +126,7 @@ int main(int argc, char** argv) {
                    "pct_reference,pct_update,pct_cond3,pct_cond6,pct_cond3_only,"
                    "pct_cond6_only,violations,label_diff,inertia,inertia_fp32,"
                    "rel_inertia,ms_dist,ms_dist_fp32,speedup,ms_prep,ms_gemm,"
-                   "ms_argmin,ms_filter,ms_setup,ms_hpupdate,"
-                   "ms_assign,iters_sddmm,iters_warp\n");
+                   "ms_argmin,ms_hpupdate,ms_assign\n");
             return 0;
         }
         else { usage(argv[0]); return 1; }
@@ -156,13 +147,7 @@ int main(int argc, char** argv) {
         printf("gemm     : FP16 operands, FP32 accumulate\n");
         printf("eps      : %.6e   ->  factor 2*eps/(1-eps) = %.6e\n",
                eps, 2.0 * eps / (1.0 - eps));
-        if (sddmm_min == MPK_SDDMM_AUTO)
-            printf("update   : SDDMM/warp crossover auto (~%.0f survivors per "
-                   "row for d=%d)\n",
-                   fmin(24.0, fmax(4.0, 10.0 * sqrt((double)d / 128.0))), d);
-        else
-            printf("update   : cusparseSDDMM when survivors >= %d, else warp "
-                   "kernel\n", sddmm_min);
+        printf("update   : flat survivor list, one warp per entry, FP32\n");
     }
 
     /* ------------------------------------------------------------ data --- */
@@ -189,11 +174,9 @@ int main(int argc, char** argv) {
     if (mpkInitRandomPoints(dP, n, d, k, (unsigned)seed, dC0) != MPK_OK) return 1;
 
     cublasHandle_t blas;   cublasCreate(&blas);
-    cusparseHandle_t sparse; cusparseCreate(&sparse);
 
     mpkParams par; mpkParamsInit(&par);
     par.max_iter      = max_iter;
-    par.sddmm_min_nnz = sddmm_min;
     par.verbose       = verbose;
 
     mpkStats smix[MPK_NCFG], sref;
@@ -206,7 +189,7 @@ int main(int argc, char** argv) {
         mpkStats junk;
         CHK(cudaMemcpy(dCmix, dC0, (size_t)k * d * sizeof(float),
                        cudaMemcpyDeviceToDevice));
-        mpkMeansMixed(blas, sparse, dP, n, d, k, dCmix, dAmix, &w, &junk);
+        mpkMeansMixed(blas, dP, n, d, k, dCmix, dAmix, &w, &junk);
         CHK(cudaMemcpy(dCref, dC0, (size_t)k * d * sizeof(float),
                        cudaMemcpyDeviceToDevice));
         mpkMeansFP32(blas, dP, n, d, k, dCref, dAref, &w, &junk);
@@ -235,7 +218,7 @@ int main(int argc, char** argv) {
             CHK(cudaMemcpy(dCmix, dC0, (size_t)k * d * sizeof(float),
                            cudaMemcpyDeviceToDevice));
             par.verify = (r == repeats - 1) ? verify : 0;
-            if (mpkMeansMixed(blas, sparse, dP, n, d, k, dCmix, dAmix, &par,
+            if (mpkMeansMixed(blas, dP, n, d, k, dCmix, dAmix, &par,
                               &smix[c]) != MPK_OK) {
                 fprintf(stderr, "mixed %s failed\n", kConfigs[c].name);
                 return 1;
@@ -262,7 +245,7 @@ int main(int argc, char** argv) {
                    "%lld,%lld,%lld,%lld,%.6f,%.6f,%.6f,"
                    "%.6f,%.6f,%.6f,%.6f,%lld,%lld,"
                    "%.9e,%.9e,%.3e,%.3f,%.3f,%.4f,"
-                   "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d\n",
+                   "%.3f,%.3f,%.3f,%.3f,%.3f\n",
                    n, d, k, blob_std, seed, kConfigs[c].name, S.iters, eps,
                    S.hp_baseline, S.hp_reference, S.hp_update, hp,
                    100.0 * (1.0 - (double)hp / base),
@@ -277,12 +260,11 @@ int main(int argc, char** argv) {
                    S.t_dist_ms, sref.t_dist_ms,
                    sref.t_dist_ms / fmax(S.t_dist_ms, 1e-9),
                    S.t_prep_ms, S.t_gemm_lo_ms, S.t_argmin_ms,
-                   S.t_filter_ms, S.t_sddmm_setup_ms, S.t_hp_update_ms,
-                   S.t_assign_ms, S.iters_sddmm, S.iters_fallback);
+                   S.t_hp_update_ms, S.t_assign_ms);
         }
     }
     if (csv) {
-        cusparseDestroy(sparse); cublasDestroy(blas);
+        cublasDestroy(blas);
         cudaFree(dP); cudaFree(dCmix); cudaFree(dCref); cudaFree(dC0);
         cudaFree(dAmix); cudaFree(dAref);
         return ok ? 0 : 2;
@@ -363,20 +345,19 @@ int main(int argc, char** argv) {
 
     /* ------------------------------------------------------- timing ------ */
     printf("\ntiming, ms over the whole run, centroid update excluded\n");
-    printf("  %-8s %5s %7s %8s %8s %8s %7s %7s %9s %8s\n",
-           "cond", "iters", "prep", "gemm", "argmin", "filter",
-           "setup", "update", "assign", "TOTAL");
+    printf("  %-8s %5s %7s %8s %10s %9s %9s %9s\n",
+           "cond", "iters", "prep", "gemm", "argmin+cond",
+           "update", "assign", "TOTAL");
     for (int c = 0; c < MPK_NCFG; ++c) {
         if (only >= 0 && only != c) continue;
         const mpkStats& S = smix[c];
-        printf("  %-8s %5d %7.2f %8.2f %8.2f %8.2f %7.2f %7.2f %9.2f %8.2f\n",
+        printf("  %-8s %5d %7.2f %8.2f %10.2f %9.2f %9.2f %9.2f\n",
                kConfigs[c].name, S.iters, S.t_prep_ms, S.t_gemm_lo_ms,
-               S.t_argmin_ms, S.t_filter_ms, S.t_sddmm_setup_ms,
-               S.t_hp_update_ms, S.t_assign_ms, S.t_dist_ms);
+               S.t_argmin_ms, S.t_hp_update_ms, S.t_assign_ms, S.t_dist_ms);
     }
-    printf("  %-8s %5d %7.2f %8.2f %8s %8s %7s %7s %9.2f %8.2f\n",
+    printf("  %-8s %5d %7.2f %8.2f %10s %9s %9.2f %9.2f\n",
            "fp32", sref.iters, sref.t_prep_ms, sref.t_gemm_lo_ms, "-", "-",
-           "-", "-", sref.t_assign_ms, sref.t_dist_ms);
+           sref.t_assign_ms, sref.t_dist_ms);
 
     printf("\n  %-8s %10s %10s %8s   %s\n", "cond", "ms/iter", "vs fp32",
            "update", "(centroid update, excluded above)");
@@ -385,9 +366,8 @@ int main(int argc, char** argv) {
         const mpkStats& S = smix[c];
         const double per = S.t_dist_ms / fmax(S.iters, 1);
         const double rper = sref.t_dist_ms / fmax(sref.iters, 1);
-        printf("  %-8s %10.3f %9.3fx %8.2f   sddmm iters %d, warp iters %d\n",
-               kConfigs[c].name, per, rper / fmax(per, 1e-9), S.t_update_ms,
-               S.iters_sddmm, S.iters_fallback);
+        printf("  %-8s %10.3f %9.3fx %8.2f\n",
+               kConfigs[c].name, per, rper / fmax(per, 1e-9), S.t_update_ms);
     }
     printf("  %-8s %10.3f %9s %8.2f\n", "fp32",
            sref.t_dist_ms / fmax(sref.iters, 1), "1.000x", sref.t_update_ms);
@@ -454,7 +434,7 @@ int main(int argc, char** argv) {
      * counter and on the clustering quality, not on label equality. */
     printf("\n%s\n", ok ? "PASS" : "CHECK FAILED");
 
-    cusparseDestroy(sparse);
+
     cublasDestroy(blas);
     cudaFree(dP); cudaFree(dCmix); cudaFree(dCref); cudaFree(dC0);
     cudaFree(dAmix); cudaFree(dAref);
