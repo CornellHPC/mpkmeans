@@ -163,6 +163,10 @@ struct RTTimer {
     void stop(cudaStream_t s, double* dst) { cudaEventRecord(b, s); acc = dst; live = true; }
     void collect() { if (!live) return; float ms = 0.f;
                      cudaEventElapsedTime(&ms, a, b); *acc += ms; live = false; }
+    /* drop the pending interval without accumulating it, for a pass whose
+     * result is being thrown away.  Zeroing *acc instead would also wipe every
+     * previous iteration's contribution, since *acc is a run total. */
+    void discard() { live = false; }
     void stop_sync(cudaStream_t s, double* dst) {
         cudaEventRecord(b, s); cudaEventSynchronize(b);
         float ms = 0.f; cudaEventElapsedTime(&ms, a, b); *dst += ms;
@@ -297,7 +301,8 @@ extern "C" mpkStatus mpkMeansBaselineRT(cublasHandle_t blas, const float* dP,
                 cudaStreamSynchronize(s);
                 nnz = (int)*h_nnz;
                 if ((size_t)nnz <= list_cap_entries) break;
-                t7.collect(); stats->t_argmin_ms = 0.0;
+                /* the overflowing scan is discarded, and not charged for */
+                t7.discard();
                 if (rt_grow(&list_buf, &list_cap, (size_t)nnz * sizeof(int))
                     != cudaSuccess) { st = MPK_ERR_ALLOC; goto done; }
                 list_cap_entries = list_cap / sizeof(int);
