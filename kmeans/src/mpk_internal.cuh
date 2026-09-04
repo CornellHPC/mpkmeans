@@ -50,6 +50,11 @@ void mpkLaunchToHalf(const float* src, __half* dst, long long n,
 void mpkLaunchRowNorms(const float* dC, int k, int d, float* out,
                        cudaStream_t s);
 
+/* Z-score each of the d features of an n x d row major P in place.  One block
+ * per feature; means and variances accumulate in FP64.  A zero-variance
+ * feature is left mean centred rather than divided by zero. */
+void mpkLaunchStandardize(float* dP, int n, int d, cudaStream_t s);
+
 /* ARGMIN + EXCLUSION COUNT.  One warp per row.  With
  * Dt(i,j) = cnorm2[j] - 2*G(i,j) it produces
  *   jbest[i]  argmin column of Dt(i,:) (smallest index on ties)

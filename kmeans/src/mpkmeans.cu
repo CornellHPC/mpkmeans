@@ -161,6 +161,13 @@ extern "C" mpkStatus mpkShiftNonNegative(float* dP, int n, int d, float* out_shi
     return MPK_OK;
 }
 
+extern "C" mpkStatus mpkStandardize(float* dP, int n, int d) {
+    if (n <= 0 || d <= 0) return MPK_ERR_INVALID;
+    mpkLaunchStandardize(dP, n, d, 0);
+    MPK_CUDA(cudaGetLastError());
+    return MPK_OK;
+}
+
 /* --------------------------------------------------------------- FP32 ---- */
 
 extern "C" mpkStatus mpkMeansFP32(cublasHandle_t blas, const float* dP, int n,

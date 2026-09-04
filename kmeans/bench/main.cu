@@ -44,6 +44,11 @@ static void usage(const char* p) {
            "  -r <int>       timed repeats, last wins   (default 1)\n"
            "  --dataset <f>  LIBSVM file instead of blobs; n and d come from\n"
            "                 the file and -n/-d are ignored\n"
+           "  --zscore       z-score normalize every feature of P before any\n"
+           "                 scheme sees it, as arXiv:2407.12208 does (their\n"
+           "                 Algorithm 5.1 line 1).  Off by default.  Changes\n"
+           "                 the SSE, since it rescales the space; a constant\n"
+           "                 feature is left mean centred, not divided by 0\n"
            "  --convergence  iterate to convergence rather than a fixed count:\n"
            "                 stop at max_j ||c_j - c_j_prev||_2 < tol, or at\n"
            "                 --maxiters, whichever comes first\n"
@@ -149,6 +154,7 @@ int main(int argc, char** argv) {
     int   accum = MPK_ACCUM_FP32;
     int   mw_macs = 3;          /* multiword: ceiling on the cross products */
     float mw_gather_frac = 0.f;     /* multiword: 0 = derive from k */
+    int   zscore = 0;               /* --zscore: standardize P up front */
 
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
@@ -165,6 +171,7 @@ int main(int argc, char** argv) {
             max_iter = atoi(next());
         else if (!strcmp(a, "--dataset")) dataset = next();
         else if (!strcmp(a, "--convergence")) converge = 1;
+        else if (!strcmp(a, "--zscore")) zscore = 1;
         else if (!strcmp(a, "--tol")) tol = (float)atof(next());
         else if (!strcmp(a, "--theta")) rt_theta = (float)atof(next());
         else if (!strcmp(a, "--macs")) mw_macs = atoi(next());
@@ -189,7 +196,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "-v")) verbose = 1;
         else if (!strcmp(a, "--csv")) csv = 1;
         else if (!strcmp(a, "--csv-header")) {
-            printf("n,d,k,std,seed,cond,iters,eps,"
+            printf("n,d,k,std,seed,zscore,cond,iters,eps,"
                    "hp_baseline,hp_reference,hp_update,hp_total,pct_eliminated,"
                    "pct_reference,pct_update,pct_cond3,pct_cond6,pct_cond3_only,"
                    "pct_cond6_only,violations,label_diff,inertia,inertia_fp32,"
@@ -260,6 +267,23 @@ int main(int argc, char** argv) {
     CHK(cudaMemcpy(dP, hP, (size_t)n * d * sizeof(float),
                    cudaMemcpyHostToDevice));
     free(hP); hP = nullptr;
+
+    /* Z-scoring, when asked for, happens here and nowhere else: before the
+     * unshifted copy below and before mpkShiftNonNegative, so that every
+     * scheme -- the shifted one the exclusion conditions run on and the
+     * unshifted one the baseline runs on -- sees the same normalized data.
+     * Doing it after the copy would silently give the two frames different
+     * datasets and invalidate every comparison in this file.
+     *
+     * It matters most to the baseline: its reliability test measures against
+     * ||p||^2 + ||c||^2, so unlike the exclusion bounds (which drop ||p||^2 by
+     * translation invariance) it is sensitive to both where the data sits and
+     * how it is scaled.  This is arXiv:2407.12208's own preprocessing step. */
+    if (zscore) {
+        if (mpkStandardize(dP, n, d) != MPK_OK) return 1;
+        if (!csv) printf("zscore   : every feature centred on its mean and "
+                         "scaled to unit variance\n");
+    }
 
     /* Conditions (3) and (6) need a non-negative P; the arXiv:2407.12208
      * baseline does not, and the shift actively hurts it -- it inflates
@@ -374,12 +398,13 @@ int main(int argc, char** argv) {
         ok = ok && cok;
 
         if (csv) {
-            printf("%d,%d,%d,%g,%d,%s,%d,%.6e,"
+            printf("%d,%d,%d,%g,%d,%d,%s,%d,%.6e,"
                    "%lld,%lld,%lld,%lld,%.6f,%.6f,%.6f,"
                    "%.6f,%.6f,%.6f,%.6f,%lld,%lld,"
                    "%.9e,%.9e,%.3e,%.3f,%.3f,%.4f,"
                    "%.3f,%.3f,%.3f,%.3f,%.3f\n",
-                   n, d, k, blob_std, seed, kConfigs[c].name, S.iters, eps,
+                   n, d, k, blob_std, seed, zscore, kConfigs[c].name,
+                   S.iters, eps,
                    S.hp_baseline, S.hp_reference, S.hp_update, hp,
                    100.0 * (1.0 - (double)hp / base),
                    100.0 * (double)S.hp_reference / base,

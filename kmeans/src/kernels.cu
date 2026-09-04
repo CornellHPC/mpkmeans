@@ -58,6 +58,17 @@ __device__ __forceinline__ float block_sum(float mine, float* sh) {
     return sh[0];
 }
 
+__device__ __forceinline__ double block_sum(double mine, double* sh) {
+    const int t = threadIdx.x;
+    sh[t] = mine;
+    __syncthreads();
+    for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
+        if (t < off) sh[t] += sh[t + off];
+        __syncthreads();
+    }
+    return sh[0];
+}
+
 /* --------------------------------------------------------------- casts --- */
 
 __global__ void k_to_half(const float* __restrict__ src, __half* __restrict__ dst,
@@ -78,6 +89,54 @@ __global__ void k_row_norms(const float* __restrict__ C, int d,
     for (int t = threadIdx.x; t < d; t += blockDim.x) acc = fmaf(c[t], c[t], acc);
     float s = block_sum(acc, sh);
     if (threadIdx.x == 0) out[j] = s;
+}
+
+/* ---------------------------------------------------- standardization ---- */
+
+/* Z-score every feature of an n x d row major P in place:
+ *
+ *     P(i,f) <- ( P(i,f) - mean_f ) / sd_f
+ *
+ * One block per feature, striding over the points.  A feature is a stride-d
+ * column, so the loads do not coalesce -- but this runs once for the dataset,
+ * not once per iteration, so the simple indexing is worth more than the
+ * bandwidth.
+ *
+ * Two passes (mean, then variance about it) rather than the sum/sum-of-squares
+ * shortcut: n reaches into the millions here, and for a feature whose mean sits
+ * far from the origin E[x^2] - E[x]^2 is a small difference of large numbers.
+ * Both passes accumulate in FP64 and only the result is rounded back to FP32.
+ * The variance is the population one (divided by n, not n-1); at these n the
+ * distinction is far below FP32 resolution.
+ *
+ * A constant feature has sd 0 and dividing by it would fill the column with
+ * inf or NaN.  LIBSVM datasets carry all-zero columns routinely, so such a
+ * feature is left mean centred instead -- divided by 1, giving an exactly zero
+ * column, which is what a feature carrying no information should contribute. */
+__global__ void k_standardize(float* __restrict__ P, int n, int d) {
+    __shared__ double sh[NTHR];
+    const int f = blockIdx.x;
+
+    double acc = 0.0;
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        acc += (double)P[(size_t)i * d + f];
+    const double mean = block_sum(acc, sh) / (double)n;
+    __syncthreads();
+
+    acc = 0.0;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const double v = (double)P[(size_t)i * d + f] - mean;
+        acc = fma(v, v, acc);
+    }
+    const double var = block_sum(acc, sh) / (double)n;
+    __syncthreads();
+
+    const double sd  = sqrt(var);
+    const double inv = sd > 1e-12 ? 1.0 / sd : 1.0;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const size_t o = (size_t)i * d + f;
+        P[o] = (float)(((double)P[o] - mean) * inv);
+    }
 }
 
 /* --------------------------------------------- argmin + exclusion test ---- */
@@ -696,6 +755,10 @@ void mpkLaunchToHalf(const float* src, __half* dst, long long n, cudaStream_t s)
 
 void mpkLaunchRowNorms(const float* dC, int k, int d, float* out, cudaStream_t s) {
     k_row_norms<<<k, NTHR, 0, s>>>(dC, d, out);
+}
+
+void mpkLaunchStandardize(float* dP, int n, int d, cudaStream_t s) {
+    k_standardize<<<d, NTHR, 0, s>>>(dP, n, d);
 }
 
 /* Enough blocks to fill the device several times over, but not one per row:

@@ -183,6 +183,21 @@ double mpkEpsilon(int d, int accum);
  * translation invariant, so the clustering is unchanged.  Returns M. */
 mpkStatus mpkShiftNonNegative(float* dP, int n, int d, float* out_shift);
 
+/* Z-score normalize P in place: each of the d features is centred on its own
+ * mean over the n points and divided by its own standard deviation, so that
+ * every feature contributes on the same scale.  This is the preprocessing step
+ * of arXiv:2407.12208 (Algorithm 5.1 line 1, and Section 6).
+ *
+ * Unlike mpkShiftNonNegative this is NOT distance preserving -- it rescales the
+ * space, so inertia is on a different footing before and after.  It is offered
+ * as a benchmark preprocessing step rather than being folded into any of the
+ * mpkMeans* routines, so that every scheme provably sees the same input.
+ *
+ * A feature with zero (or numerically negligible) variance is left mean centred
+ * rather than divided by zero, which is the common case for the all-zero
+ * columns of a sparse LIBSVM dataset. */
+mpkStatus mpkStandardize(float* dP, int n, int d);
+
 /* Add `delta` to every entry of a k x d centroid block. */
 mpkStatus mpkShiftCentroids(float* dC, int k, int d, float delta);
 
