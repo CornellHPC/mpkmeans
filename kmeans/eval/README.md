@@ -70,11 +70,18 @@ Measured on yandex 150000 x 200, k=64, 20 iterations (A100-SXM4):
 
 | | ms / iteration |
 | --- | --- |
-| `update_centers_fp32_with_reinit` | **11.25** |
-| `pairwise_euclidean_fp16_fp32` (kappa=5) | 4.49 |
+| centroid update (`update_centers_fp32_with_reinit`) | **11.25** |
+| distance (`pairwise_euclidean_fp16_fp32`, kappa=5) | 4.49 |
 | `argmin(dim=1)` | 0.11 |
 | centroid-shift norm + `.item()` | 0.04 |
 | **total** | **15.9** |
+
+`rt_baseline_mp.py` reports that split itself, per run: it wraps the package's
+CUDA entry points for one extra short fit and measures the calls the Lloyd loop
+actually makes. (`--no-profile` skips it.) The distance figure lands in the
+CSV's `ms_dist`, so `run_one.sh` can put it beside the benchmark's own
+distance-step column -- on yandex 150k x 200, k=64 that reads 4.92 ms/iter for
+`fp16_fp32` against 0.30 for our FP32 and 0.33-0.52 for the mixed schemes.
 | *for scale:* their `pairwise_euclidean_single` | *0.51* |
 | *for scale:* a plain `X@C.T` fp16 GEMM, same shape | *0.079* |
 
@@ -87,10 +94,10 @@ the allocator.
 **It is not the Python loop.** The per-iteration `.item()` host sync costs
 0.035 ms, and `argmin` 0.11.
 
-**71% of it is the centroid update**, which has nothing to do with precision.
-It costs 7.5-7.8 ms per 100k rows, flat in k between 32 and 256, so it is
-linear in n and roughly an order of magnitude slower per row than our own
-M-step.
+**71% of it is the centroid update** -- recomputing each centroid as the mean
+of the points assigned to it -- which has nothing to do with precision. It
+costs 7.5-7.8 ms per 100k rows, flat in k between 32 and 256, so it is linear
+in n and roughly an order of magnitude slower per row than ours.
 
 **The rest is the fallback, not the FP16 GEMM.** Sweeping kappa at fixed data:
 0 -> 0.48 ms, 0.5 -> 0.50, **5 -> 4.43**, 50 -> 3.71, 1e6 -> 3.71. At kappa=0

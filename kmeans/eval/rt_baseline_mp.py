@@ -166,6 +166,82 @@ def fit_once(X_t, C0_t, kernel, kappa, max_iter, tol, seed):
     return model, ms
 
 
+def iter_stats(model):
+    """Per-iteration wall times from the model, in ms.
+
+    The package times each Lloyd iteration itself, and its loop ends with a
+    .item() on the centroid shift, so each of those times is bounded by a
+    device sync and is usable.  Reported because the total divided by the
+    iteration count is NOT the per-iteration cost until the allocator is warm:
+    on a cold process iteration 0 costs 208 ms against a 16 ms steady state.
+    Printing the spread makes a warm-up that did not take visible at once,
+    rather than silently inflating an average."""
+    it = [t * 1e3 for t in model.timing_.get("iterations", [])]
+    if not it:
+        return None
+    body = it[1:] or it
+    body = sorted(body)
+    med = body[len(body) // 2]
+    return {"first": it[0], "median": med, "min": min(it), "max": max(it),
+            "n": len(it)}
+
+
+def profile_fit(X_t, C0_t, kernel, kappa, iters, seed):
+    """Split one fit into distance / centroid-update / everything else.
+
+    The package exposes no hooks, so this wraps the CUDA entry points on the
+    mp_kmeans.euclidean_cuda module for the duration of one fit.  That measures
+    the calls the Lloyd loop actually makes, at the shapes it actually uses --
+    unlike timing the kernel standalone, which measures a call the loop never
+    makes and, done badly, invents a number (see the cuvs t_dist_ms note in
+    src/cuvs_baseline.cu for how that goes wrong).
+
+    Each wrapper synchronises, so this fit is SLOWER than the timed one and its
+    total is not comparable to ms_total.  Only the split is taken from it, and
+    it runs for a few iterations because the loop is in steady state.
+    """
+    import torch
+    from mp_kmeans import euclidean_cuda as E
+
+    acc = {"dist": 0.0, "update": 0.0}
+    originals = {}
+
+    def wrap(name, bucket):
+        fn = getattr(E, name)
+        originals[name] = fn
+
+        def timed(*a, **kw):
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            out = fn(*a, **kw)
+            torch.cuda.synchronize()
+            acc[bucket] += (time.perf_counter() - t0) * 1e3
+            return out
+        setattr(E, name, timed)
+
+    for name in dir(E):
+        if name.startswith("pairwise_euclidean"):
+            wrap(name, "dist")
+        elif name.startswith("update_centers"):
+            wrap(name, "update")
+    try:
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        model, _ = fit_once(X_t, C0_t, kernel, kappa, iters, 1e-45, seed)
+        torch.cuda.synchronize()
+        wall = (time.perf_counter() - t0) * 1e3
+    finally:
+        for name, fn in originals.items():
+            setattr(E, name, fn)
+
+    it = max(model.n_iter_, 1)
+    # the loop makes one extra distance call after it ends, for the final
+    # labels, so the per-iteration figure divides by iterations + 1
+    return {"dist": acc["dist"] / (it + 1), "update": acc["update"] / it,
+            "other": (wall - acc["dist"] - acc["update"]) / it,
+            "iters": it, "wall": wall}
+
+
 def inertia_fp64(X_t, centers_t, labels_t):
     """Sum of squared distances to the assigned centre, in FP64 -- the same
     quantity mpkLaunchInertia computes for every other scheme."""
@@ -220,6 +296,12 @@ def main():
     ap.add_argument("--dump-centroids",
                     help="write the initial centroids, for mpkmeans_bench "
                          "--init-centroids")
+    ap.add_argument("--no-profile", dest="profile", action="store_false",
+                    help="skip the extra instrumented fit that splits the time "
+                         "into distance / centroid update / other.  That fit "
+                         "runs a few iterations with a device sync around every "
+                         "kernel, so it costs a little and is not part of the "
+                         "reported ms_total.")
     ap.add_argument("--reference", choices=["fp32", "none"], default="fp32",
                     help="fit the same data from the same centroids with this "
                          "package's fp32 kernel, and report the chosen "
@@ -316,7 +398,31 @@ def main():
     inert = inertia_fp64(X_t, model.cluster_centers_, model.labels_)
     print(f"{args.kernel:12s} iters={model.n_iter_:4d}  {ms:9.2f} ms  "
           f"inertia={inert:.9e}")
+    st = iter_stats(model)
+    if st:
+        print(f"  per iteration: median {st['median']:.2f} ms  "
+              f"(min {st['min']:.2f}, max {st['max']:.2f}, "
+              f"first {st['first']:.2f})")
+        if st["first"] > 1.5 * st["median"]:
+            print(f"  WARNING: iteration 0 cost {st['first']/st['median']:.1f}x "
+                  f"the median -- the full-size warm-up did not take, and "
+                  f"{ms:.0f} ms includes one-off allocator cost")
 
+    if args.profile:
+        pr = profile_fit(X_t, C0_t, args.kernel, args.kappa,
+                         min(args.maxiters, 8), args.seed)
+        tot = pr["dist"] + pr["update"] + pr["other"]
+        print(f"  where it goes, per iteration (separate instrumented fit):")
+        print(f"    {'distance (' + args.kernel + ')':24s} {pr['dist']:8.3f} ms"
+              f"   {100*pr['dist']/tot:5.1f}%")
+        print(f"    {'centroid update':24s} {pr['update']:8.3f} ms"
+              f"   {100*pr['update']/tot:5.1f}%")
+        print(f"    {'argmin, shift, python':24s} {pr['other']:8.3f} ms"
+              f"   {100*pr['other']/tot:5.1f}%")
+        # scaled to the timed fit's iteration count, for the ms_dist column
+        dist_total = pr["dist"] * (model.n_iter_ + 1)
+
+    dist_total = 0.0 if not args.profile else dist_total
     ref_ms = ref_iters = 0.0
     ref_inert = float("nan")
     label_diff = 0
@@ -364,9 +470,13 @@ def main():
             violations=0, label_diff=label_diff,
             inertia=f"{inert:.9e}",
             inertia_fp32=f"{ref_inert:.9e}", rel_inertia=f"{rel:.3e}",
-            # the fit is one library call: no stage is separable, so ms_dist is
-            # left 0 and the row appears only in the end-to-end plots
-            ms_dist=0.0, ms_dist_fp32=0.0, speedup=0.0,
+            # ms_dist is the distance step only -- the pairwise kernel the
+            # Lloyd loop calls, measured inside that loop by profile_fit and
+            # scaled to this run's iteration count.  It is a sum of measured
+            # stage times, like the benchmark's, but taken from a separately
+            # instrumented fit whose syncs perturb it slightly; 0 means
+            # --no-profile, i.e. not measured.
+            ms_dist=f"{dist_total:.3f}", ms_dist_fp32=0.0, speedup=0.0,
             ms_total=f"{ms:.3f}", ms_total_fp32=f"{ref_ms:.3f}",
             iters_fp32=int(ref_iters),
         )

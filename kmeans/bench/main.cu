@@ -677,15 +677,20 @@ int main(int argc, char** argv) {
 
     /* ------------------------------------------------------- timing ------ */
     /* `refine` is the FP32 recomputation of the entries the exclusion test
-     * could not clear; `centroid` is the M-step, the same code in every scheme.
-     * They were one column called "update" before, which was a trap now that
-     * both are shown.  TOTAL is the sum of the stages in the row; the gap
-     * between it and the end-to-end table below is the per-iteration
-     * bookkeeping -- the label-diff copy and sync, and the convergence test. */
+     * could not clear; `centroid` is the centroid update, the same code in
+     * every scheme.  They were one column called "update" before, which was a
+     * trap now that both are shown.
+     *
+     * DIST is everything it takes to get from the centroids to the labels --
+     * prep + gemm + argmin+cond + refine + assign -- which is the part the
+     * exclusion conditions actually act on, and the number to compare against
+     * another implementation's distance step.  TOTAL is DIST + centroid; the
+     * gap between it and the end-to-end table below is the per-iteration
+     * bookkeeping, the label-diff copy and sync and the convergence test. */
     printf("\ntiming, ms over the whole run\n");
-    printf("  %-8s %5s %7s %8s %11s %8s %8s %9s %9s\n",
+    printf("  %-8s %5s %7s %8s %11s %8s %8s %9s %9s %9s\n",
            "cond", "iters", "prep", "gemm", "argmin+cond",
-           "refine", "assign", "centroid", "TOTAL");
+           "refine", "assign", "DIST", "centroid", "TOTAL");
     for (int c = 0; c < MPK_NCFG; ++c) {
         if (skip(c)) continue;
         const mpkStats& S = smix[c];
@@ -693,19 +698,19 @@ int main(int argc, char** argv) {
             /* one library call: no stage is observable and none is inferable,
              * so this row is entirely dashes.  Its whole-fit time is real and
              * is in the end-to-end table below. */
-            printf("  %-8s %5d %7s %8s %11s %8s %8s %9s %9s\n",
+            printf("  %-8s %5d %7s %8s %11s %8s %8s %9s %9s %9s\n",
                    kConfigs[c].name, S.iters, "-", "-", "-", "-", "-", "-",
-                   "-");
+                   "-", "-");
             continue;
         }
-        printf("  %-8s %5d %7.2f %8.2f %11.2f %8.2f %8.2f %9.2f %9.2f\n",
+        printf("  %-8s %5d %7.2f %8.2f %11.2f %8.2f %8.2f %9.2f %9.2f %9.2f\n",
                kConfigs[c].name, S.iters, S.t_prep_ms, S.t_gemm_lo_ms,
-               S.t_argmin_ms, S.t_hp_update_ms, S.t_assign_ms, S.t_update_ms,
-               S.t_dist_ms + S.t_update_ms);
+               S.t_argmin_ms, S.t_hp_update_ms, S.t_assign_ms,
+               S.t_dist_ms, S.t_update_ms, S.t_dist_ms + S.t_update_ms);
     }
-    printf("  %-8s %5d %7.2f %8.2f %11s %8s %8.2f %9.2f %9.2f\n",
+    printf("  %-8s %5d %7.2f %8.2f %11s %8s %8.2f %9.2f %9.2f %9.2f\n",
            "fp32", sref.iters, sref.t_prep_ms, sref.t_gemm_lo_ms, "-", "-",
-           sref.t_assign_ms, sref.t_update_ms,
+           sref.t_assign_ms, sref.t_dist_ms, sref.t_update_ms,
            sref.t_dist_ms + sref.t_update_ms);
 
 

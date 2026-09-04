@@ -176,20 +176,24 @@ echo "=============================================================="
 echo " both, per iteration, on the same $SHARED_N x $SHARED_D points"
 echo "=============================================================="
 awk -F, -v rt="$OUT/rt.csv" '
-    BEGIN { printf "  %-18s %6s %12s %12s %16s\n",
-                   "impl","iters","total ms","ms/iter","inertia" }
-    NR > 1 { printf "  %-18s %6d %12.2f %12.3f %16s\n",
-                    $10, $11, $37, $37/($11?$11:1), $26 }
+    BEGIN { printf "  %-18s %6s %10s %10s %10s %16s\n",
+                   "impl","iters","dist/iter","tot/iter","total ms","inertia" }
+    NR > 1 { printf "  %-18s %6d %10s %10.3f %10.2f %16s\n",
+                    $10, $11, ($29+0 > 0 ? sprintf("%.3f", $29/($11?$11:1)) : "-"),
+                    $37/($11?$11:1), $37, $26 }
     END {
         while ((getline line < rt) > 0) {
             n = split(line, f, ",")
             if (f[10] == "cond" || f[10] == "") continue
-            printf "  %-18s %6d %12.2f %12.3f %16s\n",
-                   "rt-mp " f[9], f[11], f[37], f[37]/(f[11]?f[11]:1), f[26]
+            printf "  %-18s %6d %10s %10.3f %10.2f %16s\n",
+                   "rt-mp " f[9], f[11],
+                   (f[29]+0 > 0 ? sprintf("%.3f", f[29]/(f[11]?f[11]:1)) : "-"),
+                   f[37]/(f[11]?f[11]:1), f[37], f[26]
         }
     }' "$OUT/bench.csv"
-awk -F, 'NR==2 { printf "  %-18s %6d %12.2f %12.3f %16s\n",
-                        "fp32", $39, $38, $38/($39?$39:1), $27 }' "$OUT/bench.csv"
+awk -F, 'NR==2 { printf "  %-18s %6d %10.3f %10.3f %10.2f %16s\n",
+                        "fp32", $39, $30/($39?$39:1), $38/($39?$39:1), $38, $27 }' \
+    "$OUT/bench.csv"
 
 [[ $KEEP -eq 1 ]] || { rm -f "$DATA" "$DATA.meta"; echo; echo "(removed $DATA; --keep to retain it)"; }
 echo "CSVs: $OUT/bench.csv  $OUT/rt.csv"
