@@ -93,6 +93,7 @@ extern "C" void mpkParamsInit(mpkParams* p) {
     p->accum         = MPK_ACCUM_FP32;
     p->mw_macs       = 3;
     p->mw_gather_frac= 0.f;   /* derive from k */
+    p->cuvs_batch    = 0;     /* n: one untiled pass */
     p->rt_theta      = 0.f;
     p->verify        = 0;
     p->verbose       = 0;

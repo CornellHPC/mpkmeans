@@ -93,6 +93,11 @@ typedef struct {
                            * picks the crossover from k, which is what it
                            * actually tracks: measured ~0.20 at k=32, ~0.33 at
                            * k=128, ~0.70 at k=256                              */
+    int   cuvs_batch;     /* cuVS baseline only (mpkMeansCuvs): rows per 1NN
+                           * tile.  0 (the default) means n, one untiled pass,
+                           * which is the shape our own schemes run in; cuVS's
+                           * own default is 32768, and passing that measures
+                           * the library as it ships instead.               */
     float rt_theta;       /* baseline only (mpkMeansBaselineRT): the safety
                            * factor of arXiv:2407.12208 (4.13).  Must be > 2.
                            * <= 0 selects the default, 2.5, which reproduces
@@ -229,6 +234,29 @@ mpkStatus mpkMeansMixed(cublasHandle_t blas,
 mpkStatus mpkMeansBaselineRT(cublasHandle_t blas, const float* dP, int n, int d,
                              int k, float* dC, int* dAssign,
                              const mpkParams* params, mpkStats* stats);
+
+/* Whether the cuVS baseline was compiled in (-DMPK_CUVS=ON and a cuVS install
+ * found).  mpkMeansCuvs returns MPK_ERR_INVALID when this is 0. */
+int mpkHaveCuvs(void);
+
+/* Baseline: cuVS (RAPIDS) k-means, FP32 throughout, for scale -- it says
+ * whether mpkMeansFP32, which everything here is normalised against, is a fair
+ * FP32 reference or a slow one.
+ *
+ * Same argument shape as the other drivers, and deliberately fed the same way:
+ * dC must hold the shared initial centroids on entry (cuVS is told to use them
+ * rather than running its own k-means++), and dP should be the UNSHIFTED
+ * points, since cuVS neither needs nor benefits from the (3)/(6) shift.
+ * `blas` is unused -- cuVS carries its own handles.
+ *
+ * stats->t_total_ms is the cuvsKMeansFit call and is the only timing directly
+ * comparable to another implementation; stats->t_dist_ms is one assignment pass
+ * timed separately and scaled by the iteration count.  The full account of what
+ * is and is not held equal is in the src/cuvs_baseline.cu file comment; read it
+ * before quoting any number from this. */
+mpkStatus mpkMeansCuvs(cublasHandle_t blas, const float* dP, int n, int d,
+                       int k, float* dC, int* dAssign,
+                       const mpkParams* params, mpkStats* stats);
 
 mpkStatus mpkMeansFP32(cublasHandle_t blas,
                        const float* dP, int n, int d, int k,

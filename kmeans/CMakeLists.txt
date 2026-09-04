@@ -33,10 +33,19 @@ option(MPK_MULTIWORD "build the multiword (mpemu) driver" ON)
 set(MPEMU_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../gemm-emulation"
     CACHE PATH "root of the gemm-emulation project")
 
+# The cuVS FP32 baseline is an outside implementation used for scale.  Default
+# OFF: it needs a RAPIDS install, which is not part of this tree, and the driver
+# compiles to a stub reporting the missing dependency when it is absent.
+#   cmake -DMPK_CUVS=ON -DCUVS_ROOT=/path/to/env ...
+option(MPK_CUVS "build the cuVS (RAPIDS) FP32 k-means baseline" OFF)
+set(CUVS_ROOT "" CACHE PATH
+    "prefix holding include/cuvs, include/dlpack and lib/libcuvs_c.so")
+
 add_library(mpkmeans STATIC
     src/kernels.cu
     src/baseline.cu
     src/multiword.cu
+    src/cuvs_baseline.cu
     src/mpkmeans.cu
     src/data.cu)
 add_library(mpkmeans::mpkmeans ALIAS mpkmeans)
@@ -55,6 +64,26 @@ if(MPK_MULTIWORD)
     else()
         message(STATUS "mpkmeans: multiword driver OFF -- mpemu not found "
                        "under ${MPEMU_ROOT} (set -DMPEMU_ROOT=...)")
+    endif()
+endif()
+
+if(MPK_CUVS)
+    find_library(CUVS_C_LIBRARY cuvs_c HINTS "${CUVS_ROOT}/lib")
+    find_library(CUVS_LIBRARY   cuvs   HINTS "${CUVS_ROOT}/lib")
+    find_path(CUVS_INCLUDE_DIR  cuvs/cluster/kmeans.h HINTS "${CUVS_ROOT}/include")
+    find_path(DLPACK_INCLUDE_DIR dlpack/dlpack.h HINTS "${CUVS_ROOT}/include")
+    if(CUVS_C_LIBRARY AND CUVS_LIBRARY AND CUVS_INCLUDE_DIR AND DLPACK_INCLUDE_DIR)
+        message(STATUS "mpkmeans: cuVS baseline on (${CUVS_C_LIBRARY})")
+        target_compile_definitions(mpkmeans PUBLIC MPK_CUVS)
+        target_include_directories(mpkmeans PRIVATE
+            "${CUVS_INCLUDE_DIR}" "${DLPACK_INCLUDE_DIR}")
+        target_link_libraries(mpkmeans PUBLIC "${CUVS_C_LIBRARY}" "${CUVS_LIBRARY}")
+        # the RAPIDS libraries live outside any default search path
+        set_target_properties(mpkmeans PROPERTIES
+            INTERFACE_LINK_DIRECTORIES "${CUVS_ROOT}/lib")
+    else()
+        message(STATUS "mpkmeans: cuVS baseline OFF -- not found under "
+                       "${CUVS_ROOT} (set -DCUVS_ROOT=...)")
     endif()
 endif()
 
@@ -85,9 +114,15 @@ set_target_properties(mpkmeans_bench PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
 
 # libmpemu.so is not on any default search path, so bake its location into the
 # binary rather than making every run depend on LD_LIBRARY_PATH.
+set(MPK_BENCH_RPATH "")
 if(MPK_MULTIWORD AND MPEMU_LIBRARY)
-    set_target_properties(mpkmeans_bench PROPERTIES
-        BUILD_RPATH "${MPEMU_ROOT}/build")
+    list(APPEND MPK_BENCH_RPATH "${MPEMU_ROOT}/build")
+endif()
+if(MPK_CUVS AND CUVS_C_LIBRARY)
+    list(APPEND MPK_BENCH_RPATH "${CUVS_ROOT}/lib")
+endif()
+if(MPK_BENCH_RPATH)
+    set_target_properties(mpkmeans_bench PROPERTIES BUILD_RPATH "${MPK_BENCH_RPATH}")
 endif()
 
 # Perlmutter's Cray PE injects -lgdrapi -lmpich into every nvcc invocation.

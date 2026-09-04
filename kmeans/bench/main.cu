@@ -67,11 +67,16 @@ static void usage(const char* p) {
            "                 products the refinement cascade may reach, 1..3\n"
            "                 (default 3 = double-fp16; a stage is only issued\n"
            "                  if the previous exclusion test left survivors)\n"
+           "  --cuvs-batch <int>  cuvs only: rows per 1NN tile.  0 (default)\n"
+           "                 means n -- one untiled pass, the shape our own\n"
+           "                 schemes run in.  cuVS's own default is 32768;\n"
+           "                 pass it to measure the library as it ships\n"
            "  --only <c>     run one config only: 3, 6, 36, c (cascade),\n"
            "                 rt (arXiv:2407.12208 baseline), raw (no exclusion\n"
            "                 test, no FP32 refinement -- the low precision\n"
            "                 argmin trusted outright, no correctness guarantee),\n"
-           "                 mw (multiword double-fp16)\n"
+           "                 mw (multiword double-fp16),\n"
+           "                 cuvs (RAPIDS FP32 k-means, needs -DMPK_CUVS=ON)\n"
            "  --no-verify    skip the per-iteration FP64 oracle check\n"
            "                 (the oracle needs a -DMPK_STATS=ON build; it is\n"
            "                  on by default there and absent otherwise)\n"
@@ -114,7 +119,8 @@ static double label_agreement(const std::vector<int>& a, const std::vector<int>&
 struct Config {
     const char* name;
     int cond3, cond6, cascade;
-    int driver;   /* 0 mpkMeansMixed, 1 mpkMeansBaselineRT, 2 mpkMeansMultiword */
+    int driver;   /* 0 mpkMeansMixed, 1 mpkMeansBaselineRT,
+                   * 2 mpkMeansMultiword, 3 mpkMeansCuvs             */
 };
 
 /* (3)->(6) is the cascade: the same exclusions as (3)+(6), but the reference
@@ -134,7 +140,12 @@ struct Config {
  * refinement is another tensor-core GEMM rather than a warp-per-entry FP32
  * dot, so the number to watch for it is cross products per iteration, not
  * entries refined. */
-#define MPK_NCFG 7
+/* cuvs is RAPIDS' own FP32 k-means, run on the same points from the same
+ * initial centroids.  It is not a precision scheme at all -- it is the scale
+ * against which "faster than fp32" is worth anything, since our fp32 reference
+ * is our own code and could simply be slow.  Only present when the library was
+ * built with -DMPK_CUVS=ON; otherwise its row is skipped. */
+#define MPK_NCFG 8
 static const Config kConfigs[MPK_NCFG] = {
     {"(3)",     1, 0, 0, 0},
     {"(6)",     0, 1, 0, 0},
@@ -143,6 +154,7 @@ static const Config kConfigs[MPK_NCFG] = {
     {"rt-base", 0, 0, 0, 1},
     {"raw",     0, 0, 0, 0},
     {"mw",      1, 1, 0, 2},
+    {"cuvs",    0, 0, 0, 3},
 };
 
 int main(int argc, char** argv) {
@@ -157,6 +169,7 @@ int main(int argc, char** argv) {
     int   mw_macs = 3;          /* multiword: ceiling on the cross products */
     float mw_gather_frac = 0.f;     /* multiword: 0 = derive from k */
     int   zscore = 0;               /* --zscore: standardize P up front */
+    int   cuvs_batch = 0;           /* cuvs: 0 = n, one untiled pass    */
 
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
@@ -174,6 +187,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "--dataset")) dataset = next();
         else if (!strcmp(a, "--convergence")) converge = 1;
         else if (!strcmp(a, "--zscore")) zscore = 1;
+        else if (!strcmp(a, "--cuvs-batch")) cuvs_batch = atoi(next());
         else if (!strcmp(a, "--tol")) tol = (float)atof(next());
         else if (!strcmp(a, "--theta")) rt_theta = (float)atof(next());
         else if (!strcmp(a, "--macs")) mw_macs = atoi(next());
@@ -192,7 +206,7 @@ int main(int argc, char** argv) {
             only = !strcmp(v, "3") ? 0 : !strcmp(v, "6") ? 1 :
                    !strcmp(v, "36") ? 2 : !strcmp(v, "c") ? 3 :
                    !strcmp(v, "rt") ? 4 : !strcmp(v, "raw") ? 5 :
-                   !strcmp(v, "mw") ? 6 : -1;
+                   !strcmp(v, "mw") ? 6 : !strcmp(v, "cuvs") ? 7 : -1;
             if (only < 0) { usage(argv[0]); return 1; }
         }
         else if (!strcmp(a, "-v")) verbose = 1;
@@ -208,6 +222,12 @@ int main(int argc, char** argv) {
         }
         else { usage(argv[0]); return 1; }
     }
+    if (only >= 0 && kConfigs[only].driver == 3 && !mpkHaveCuvs()) {
+        fprintf(stderr, "--only cuvs: this build has no cuVS baseline.  "
+                        "Rebuild with -DMPK_CUVS=ON -DCUVS_ROOT=<prefix>.\n");
+        return 1;
+    }
+
     /* A dataset defines n and d -- only the file knows them -- so it is read
      * before anything that depends on the shape, and -n/-d are ignored. */
     float* hP = nullptr;
@@ -316,6 +336,7 @@ int main(int argc, char** argv) {
     par.accum         = accum;
     par.mw_macs       = mw_macs;
     par.mw_gather_frac= mw_gather_frac;
+    par.cuvs_batch    = cuvs_batch;
     par.verbose       = verbose;
 
     mpkStats smix[MPK_NCFG], sref;
@@ -335,6 +356,14 @@ int main(int argc, char** argv) {
         CHK(cudaMemcpy(dCmix, dC0, (size_t)k * d * sizeof(float),
                        cudaMemcpyDeviceToDevice));
         mpkMeansMultiword(blas, dP, n, d, k, dCmix, dAmix, &w, &junk);
+        if (mpkHaveCuvs()) {
+            /* cuVS builds its own handles and memory pool on first use; that
+             * one-off must not land inside a timed fit */
+            CHK(cudaMemcpy(dCmix, dC0, (size_t)k * d * sizeof(float),
+                           cudaMemcpyDeviceToDevice));
+            mpkShiftCentroids(dCmix, k, d, -shift);
+            mpkMeansCuvs(blas, dPraw, n, d, k, dCmix, dAmix, &w, &junk);
+        }
         CHK(cudaMemcpy(dCref, dC0, (size_t)k * d * sizeof(float),
                        cudaMemcpyDeviceToDevice));
         mpkMeansFP32(blas, dP, n, d, k, dCref, dAref, &w, &junk);
@@ -353,9 +382,16 @@ int main(int argc, char** argv) {
                    cudaMemcpyDeviceToHost));
 
     int ok = 1;
+    /* cuvs is a row only when the library was built against RAPIDS; without it
+     * the driver is a stub, so the row is dropped everywhere rather than
+     * reported as a failure. */
+    auto skip = [&](int c) {
+        if (only >= 0 && only != c) return true;
+        return kConfigs[c].driver == 3 && !mpkHaveCuvs();
+    };
     std::vector<std::vector<int>> amix(MPK_NCFG, std::vector<int>(n));
     for (int c = 0; c < MPK_NCFG; ++c) {
-        if (only >= 0 && only != c) continue;
+        if (skip(c)) continue;
         par.use_cond3 = kConfigs[c].cond3;
         par.use_cond6 = kConfigs[c].cond6;
         par.cascade   = kConfigs[c].cascade;
@@ -367,7 +403,7 @@ int main(int argc, char** argv) {
              * start from the same points in their own frame.  The multiword
              * driver stays in the shifted frame: its bound, like (3)/(6)'s,
              * is componentwise against |A||B| and needs non-negative P. */
-            if (kConfigs[c].driver == 1)
+            if (kConfigs[c].driver == 1 || kConfigs[c].driver == 3)
                 mpkShiftCentroids(dCmix, k, d, -shift);
             const mpkStatus rc =
                 kConfigs[c].driver == 1
@@ -376,6 +412,9 @@ int main(int argc, char** argv) {
               : kConfigs[c].driver == 2
                     ? mpkMeansMultiword(blas, dP, n, d, k, dCmix, dAmix, &par,
                                         &smix[c])
+              : kConfigs[c].driver == 3
+                    ? mpkMeansCuvs(blas, dPraw, n, d, k, dCmix, dAmix, &par,
+                                   &smix[c])
                     : mpkMeansMixed(blas, dP, n, d, k, dCmix, dAmix, &par,
                                     &smix[c]);
             if (rc != MPK_OK) {
@@ -388,7 +427,7 @@ int main(int argc, char** argv) {
     }
 
     for (int c = 0; c < MPK_NCFG; ++c) {
-        if (only >= 0 && only != c) continue;
+        if (skip(c)) continue;
         const mpkStats& S = smix[c];
         const double base = (double)(S.hp_baseline ? S.hp_baseline : 1);
         const long long hp = S.hp_reference + S.hp_update;
@@ -437,7 +476,7 @@ int main(int argc, char** argv) {
     printf("  %-8s %6s %14s %14s %14s %11s\n",
            "cond", "iters", "reference", "survivors", "total", "ELIMINATED");
     for (int c = 0; c < MPK_NCFG; ++c) {
-        if (only >= 0 && only != c) continue;
+        if (skip(c)) continue;
         const mpkStats& S = smix[c];
         const double it = (double)(S.iters ? S.iters : 1);
         const double base = (double)n * k;
@@ -459,7 +498,7 @@ int main(int argc, char** argv) {
     {
         int it_min = 0, it_max = 0;
         for (int c = 0; c < MPK_NCFG; ++c) {
-            if (only >= 0 && only != c) continue;
+            if (skip(c)) continue;
             const int v = smix[c].iters;
             if (!it_min || v < it_min) it_min = v;
             if (v > it_max) it_max = v;
@@ -469,7 +508,7 @@ int main(int argc, char** argv) {
                    "  iterations (%d..%d).  Per-iteration numbers are comparable;\n"
                    "  run totals are not.  Totals over the whole run:\n", it_min, it_max);
             for (int c = 0; c < MPK_NCFG; ++c) {
-                if (only >= 0 && only != c) continue;
+                if (skip(c)) continue;
                 const mpkStats& S = smix[c];
                 printf("    %-8s %d iters:  %lld of %lld\n", kConfigs[c].name,
                        S.iters, S.hp_reference + S.hp_update, S.hp_baseline);
@@ -486,11 +525,12 @@ int main(int argc, char** argv) {
                "  not clear, so its share is over that subset, not over all n\n");
         printf("  the denominator is n*(k-1) for the exclusion schemes, whose\n"
                "  incumbent is exempt, and n*k for rt-base, which tests every\n"
-               "  entry; rt-base excludes nothing, so its row is 0 either way\n");
+               "  entry; rt-base excludes nothing, so its row is 0 either way,\n"
+               "  and cuvs runs no exclusion test at all, so neither does its\n");
         printf("  %-8s %10s %10s %10s %10s %10s\n",
                "cond", "(3) held", "(6) held", "both", "(3) only", "(6) only");
         for (int c = 0; c < MPK_NCFG; ++c) {
-            if (only >= 0 && only != c) continue;
+            if (skip(c)) continue;
             const mpkStats& S = smix[c];
             const double tb = (double)(S.tested ? S.tested : 1);
             printf("  %-8s %9.4f%% %9.4f%% %9.4f%% %9.4f%% %9.4f%%\n",
@@ -512,8 +552,16 @@ int main(int argc, char** argv) {
            "cond", "iters", "prep", "gemm", "argmin+cond",
            "update", "assign", "TOTAL");
     for (int c = 0; c < MPK_NCFG; ++c) {
-        if (only >= 0 && only != c) continue;
+        if (skip(c)) continue;
         const mpkStats& S = smix[c];
+        if (kConfigs[c].driver == 3) {
+            /* one library call: the stages exist but are not observable, so
+               only the assignment pass and the whole-fit total are real */
+            printf("  %-8s %5d %7s %8s %10s %9s %9s %9.2f\n",
+                   kConfigs[c].name, S.iters, "-", "-", "-", "-", "-",
+                   S.t_dist_ms);
+            continue;
+        }
         printf("  %-8s %5d %7.2f %8.2f %10.2f %9.2f %9.2f %9.2f\n",
                kConfigs[c].name, S.iters, S.t_prep_ms, S.t_gemm_lo_ms,
                S.t_argmin_ms, S.t_hp_update_ms, S.t_assign_ms, S.t_dist_ms);
@@ -525,15 +573,42 @@ int main(int argc, char** argv) {
     printf("\n  %-8s %10s %10s %8s   %s\n", "cond", "ms/iter", "vs fp32",
            "update", "(centroid update, excluded above)");
     for (int c = 0; c < MPK_NCFG; ++c) {
-        if (only >= 0 && only != c) continue;
+        if (skip(c)) continue;
         const mpkStats& S = smix[c];
         const double per = S.t_dist_ms / fmax(S.iters, 1);
         const double rper = sref.t_dist_ms / fmax(sref.iters, 1);
-        printf("  %-8s %10.3f %9.3fx %8.2f\n",
-               kConfigs[c].name, per, rper / fmax(per, 1e-9), S.t_update_ms);
+        if (kConfigs[c].driver == 3)
+            printf("  %-8s %10.3f %9.3fx %8s\n",
+                   kConfigs[c].name, per, rper / fmax(per, 1e-9), "-");
+        else
+            printf("  %-8s %10.3f %9.3fx %8.2f\n",
+                   kConfigs[c].name, per, rper / fmax(per, 1e-9), S.t_update_ms);
     }
     printf("  %-8s %10.3f %9s %8.2f\n", "fp32",
            sref.t_dist_ms / fmax(sref.iters, 1), "1.000x", sref.t_update_ms);
+
+    /* The tables above split the loop into stages, which only works for code
+     * we wrote.  This one does not split anything: it is the whole fit, wall
+     * clock, from the first kernel to the last -- assignment, centroid update,
+     * convergence test and all the bookkeeping in between.  It is the only
+     * column an outside implementation can be held to, and the schemes here
+     * converge in different numbers of iterations, so ms/iter is the column to
+     * read and the run total is there for context. */
+    printf("\n  end to end, the whole fit (nothing excluded)\n");
+    printf("  %-8s %5s %10s %10s %10s\n", "cond", "iters", "total ms",
+           "ms/iter", "vs fp32");
+    {
+        const double rper = sref.t_total_ms / fmax(sref.iters, 1);
+        for (int c = 0; c < MPK_NCFG; ++c) {
+            if (skip(c)) continue;
+            const mpkStats& S = smix[c];
+            const double per = S.t_total_ms / fmax(S.iters, 1);
+            printf("  %-8s %5d %10.2f %10.3f %9.3fx\n", kConfigs[c].name,
+                   S.iters, S.t_total_ms, per, rper / fmax(per, 1e-9));
+        }
+        printf("  %-8s %5d %10.2f %10.3f %9s\n", "fp32", sref.iters,
+               sref.t_total_ms, rper, "1.000x");
+    }
 
     /* The FP32 refinement is the same kernel for every scheme here -- one warp
      * per flagged entry, WPB=8, 256 threads, the same grid cap -- differing
@@ -545,7 +620,7 @@ int main(int argc, char** argv) {
     printf("  %-8s %14s %12s %12s\n", "cond", "entries/iter", "ms/iter",
            "ns/entry");
     for (int c = 0; c < MPK_NCFG; ++c) {
-        if (only >= 0 && only != c) continue;
+        if (skip(c) || kConfigs[c].driver == 3) continue;  /* cuvs refines nothing */
         const mpkStats& S = smix[c];
         const double it = fmax(S.iters, 1);
         printf("  %-8s %14.1f %12.4f %12.2f\n", kConfigs[c].name,
@@ -567,7 +642,7 @@ int main(int argc, char** argv) {
             printf("  %-8s %16s %14s %14s %14s\n", "cond", "products/iter",
                    "ms gemm/iter", "eps at cut", "refine width");
             for (int c = 0; c < MPK_NCFG; ++c) {
-                if (only >= 0 && only != c) continue;
+                if (skip(c)) continue;
                 if (kConfigs[c].driver != 2) continue;
                 const mpkStats& S = smix[c];
                 const double it = fmax(S.iters, 1);
@@ -605,7 +680,7 @@ int main(int argc, char** argv) {
         printf("  %-8s %20s %22s %12s\n", "cond", "bound violations",
                "label != fp32 label", "excess");
         for (int c = 0; c < MPK_NCFG; ++c) {
-            if (only >= 0 && only != c) continue;
+            if (skip(c)) continue;
             const mpkStats& S = smix[c];
             const long long rows = (long long)n * S.iters;
             printf("  %-8s %9lld / %-8lld %9lld / %-8lld %12.4e\n",
@@ -623,6 +698,7 @@ int main(int argc, char** argv) {
                "  rt-base has no per-iteration hookup into this oracle at all --\n"
                "  a different strategy entirely -- so its row always reads\n"
                "  0/rows: an absence of measurement, not a passing check.\n"
+               "  The same goes for cuvs, which is one opaque library call.\n"
                "  raw ran no exclusion test, so \"reachable\" is trivially every\n"
                "  row: its bound violations column is 0 by construction, for the\n"
                "  same reason, but label != fp32 label and excess are real --\n"
@@ -639,7 +715,7 @@ int main(int argc, char** argv) {
 
     printf("\nclustering\n");
     for (int c = 0; c < MPK_NCFG; ++c) {
-        if (only >= 0 && only != c) continue;
+        if (skip(c)) continue;
         const mpkStats& S = smix[c];
         long long identical = 0;
         for (int i = 0; i < n; ++i) identical += (amix[c][i] == aref[i]);
