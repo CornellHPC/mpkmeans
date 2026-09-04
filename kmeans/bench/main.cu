@@ -699,30 +699,12 @@ int main(int argc, char** argv) {
            "fp32", sref.iters, sref.t_prep_ms, sref.t_gemm_lo_ms, "-", "-",
            sref.t_assign_ms, sref.t_dist_ms);
 
-    printf("\n  %-8s %10s %10s %8s   %s\n", "cond", "ms/iter", "vs fp32",
-           "update", "(centroid update, excluded above)");
-    for (int c = 0; c < MPK_NCFG; ++c) {
-        if (skip(c)) continue;
-        const mpkStats& S = smix[c];
-        const double per = S.t_dist_ms / fmax(S.iters, 1);
-        const double rper = sref.t_dist_ms / fmax(sref.iters, 1);
-        if (kConfigs[c].driver == 3)
-            printf("  %-8s %10.3f %9.3fx %8s\n",
-                   kConfigs[c].name, per, rper / fmax(per, 1e-9), "-");
-        else
-            printf("  %-8s %10.3f %9.3fx %8.2f\n",
-                   kConfigs[c].name, per, rper / fmax(per, 1e-9), S.t_update_ms);
-    }
-    printf("  %-8s %10.3f %9s %8.2f\n", "fp32",
-           sref.t_dist_ms / fmax(sref.iters, 1), "1.000x", sref.t_update_ms);
 
-    /* The tables above split the loop into stages, which only works for code
+    /* The table above splits the loop into stages, which only works for code
      * we wrote.  This one does not split anything: it is the whole fit, wall
      * clock, from the first kernel to the last -- assignment, centroid update,
      * convergence test and all the bookkeeping in between.  It is the only
-     * column an outside implementation can be held to, and the schemes here
-     * converge in different numbers of iterations, so ms/iter is the column to
-     * read and the run total is there for context. */
+     * column an outside implementation can be held to. */
     printf("\n  end to end, the whole fit (nothing excluded)\n");
     printf("  %-8s %5s %10s %10s %10s\n", "cond", "iters", "total ms",
            "ms/iter", "vs fp32");
@@ -737,58 +719,6 @@ int main(int argc, char** argv) {
         }
         printf("  %-8s %5d %10.2f %10.3f %9s\n", "fp32", sref.iters,
                sref.t_total_ms, rper, "1.000x");
-    }
-
-    /* The FP32 refinement is the same kernel for every scheme here -- one warp
-     * per flagged entry, WPB=8, 256 threads, the same grid cap -- differing
-     * only in whether it forms p.c or ||p-c||^2.  So its cost is a count, not
-     * a rate, and the schemes are separated by how many entries they flag, not
-     * by how fast they refine one.  ns/entry says whether that holds: if two
-     * schemes disagree there, something other than the count is at work. */
-    printf("\n  refinement cost, normalised -- same kernel for every scheme\n");
-    printf("  %-8s %14s %12s %12s\n", "cond", "entries/iter", "ms/iter",
-           "ns/entry");
-    for (int c = 0; c < MPK_NCFG; ++c) {
-        if (skip(c) || kConfigs[c].driver == 3) continue;  /* cuvs refines nothing */
-        const mpkStats& S = smix[c];
-        const double it = fmax(S.iters, 1);
-        printf("  %-8s %14.1f %12.4f %12.2f\n", kConfigs[c].name,
-               (double)S.hp_update / it, S.t_hp_update_ms / it,
-               S.hp_update ? S.t_hp_update_ms * 1e6 / (double)S.hp_update : 0.0);
-    }
-
-    /* The multiword scheme does not refine entries at all -- it refines the
-     * whole matrix, one fp16 cross product at a time, and the exclusion test
-     * decides whether the next product is issued.  So its cost is a product
-     * count, and the row above (a gather out of an already-refined G) says
-     * nothing about it. */
-    {
-        int any_mw = 0;
-        for (int c = 0; c < MPK_NCFG; ++c)
-            if ((only < 0 || only == c) && kConfigs[c].driver == 2) any_mw = 1;
-        if (any_mw) {
-            printf("\n  multiword cost -- cross products, not entries\n");
-            printf("  %-8s %16s %14s %14s %14s\n", "cond", "products/iter",
-                   "ms gemm/iter", "eps at cut", "refine width");
-            for (int c = 0; c < MPK_NCFG; ++c) {
-                if (skip(c)) continue;
-                if (kConfigs[c].driver != 2) continue;
-                const mpkStats& S = smix[c];
-                const double it = fmax(S.iters, 1);
-                const double per = (double)S.mw_products / it;
-                /* the bound actually reached, at the average product count */
-                const int cut = (int)(per + 0.5) < 1 ? 1
-                              : ((int)(per + 0.5) > 3 ? 3 : (int)(per + 0.5));
-                printf("  %-8s %16.2f %14.4f %14.3e %13.1f%%\n",
-                       kConfigs[c].name, per, S.t_gemm_lo_ms / it,
-                       mpkMultiwordEpsilon(d, cut),
-                       100.0 * (double)S.mw_refine_rows / (it * (double)n));
-            }
-            printf("  1.00 means the bound settled every row from the leading\n"
-                   "  product alone; 3.00 means it always needed full\n"
-                   "  double-fp16.  eps is mpkMultiwordEpsilon at that cut --\n"
-                   "  the accuracy the answer actually carries.\n");
-        }
     }
 
     /* ---------------------------------------------------- verification --- */
