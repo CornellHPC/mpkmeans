@@ -12,6 +12,10 @@ rt-base was written against.
 
 What is held equal to the C++ benchmark, and how:
 
+  subsampling   NOT shared.  This draws with numpy's Generator and the bench
+                with std::mt19937, so the same -e picks different rows.  When
+                --subsample is in play, use --dump-subsample here and hand the
+                bench that file with --bin, or the two cluster different data.
   data          --bin and --libsvm read exactly the files mpkmeans_bench reads,
                 so the matrix clustered is the same one, bit for bit.  --blobs
                 mirrors mpkMakeBlobs' construction (centers uniform in
@@ -36,9 +40,14 @@ What is held equal to the C++ benchmark, and how:
 
 What cannot be held equal:
 
-  stopping      theirs is ||C_new - C_old||_F < tol over the whole k x d block;
-                ours is max_j ||c_j - c_j_prev||_2 < tol.  Frobenius bounds the
-                max, so at equal tol theirs is the stricter test.
+  stopping      both stop on ||C - C_prev||_F < tol over the whole k x d
+                block.  The C++ side was moved onto that rule to match this
+                package (and cuVS, whose shift clause is the same quantity),
+                so at equal --tol the two run the same recurrence to the same
+                point.  One residual difference: our loop also breaks when no
+                label changed, which this package does not test -- but stable
+                labels give identical centroids and hence ||C - C_prev||_F = 0,
+                so the two fire on the same iteration.
   loop shape    their fit ends on a centroid update and then re-assigns, so the
                 labels are half a Lloyd step ahead of ours, exactly as cuVS's
                 are.  At convergence this does not matter.
@@ -183,6 +192,13 @@ def main():
     ap.add_argument("--kernel", default="fp16_fp32")
     ap.add_argument("--zscore", action="store_true")
     ap.add_argument("--subsample", type=int, default=0)
+    ap.add_argument("--dump-subsample",
+                    help="write the subsampled matrix here as raw float32.  "
+                         "REQUIRED for a matched comparison when --subsample "
+                         "is used: this driver draws with numpy's Generator "
+                         "and mpkmeans_bench with std::mt19937, so the same "
+                         "-e gives DIFFERENT subsets.  Point the bench at this "
+                         "file with --bin instead of letting it subsample.")
     ap.add_argument("--centroids", help="read initial centroids (k x d float32)")
     ap.add_argument("--dump-centroids",
                     help="write the initial centroids, for mpkmeans_bench "
@@ -220,6 +236,10 @@ def main():
         idx = np.sort(rng.choice(n, size=args.subsample, replace=False))
         X = np.ascontiguousarray(X[idx])
         n = X.shape[0]
+        if args.dump_subsample:
+            X.astype(np.float32).tofile(args.dump_subsample)
+            print(f"wrote {args.dump_subsample} ({n} x {X.shape[1]} float32) "
+                  f"-- give this to mpkmeans_bench --bin, not --subsample")
 
     if args.zscore:
         X = zscore(X)

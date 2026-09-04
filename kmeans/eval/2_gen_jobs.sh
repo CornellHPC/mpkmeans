@@ -117,6 +117,7 @@ if [[ $DRY -eq 0 ]]; then
 fi
 
 NJOB=0; NRUN=0; NSKIP=0
+SUBSAMPLED_SETS=""
 
 # ---------------------------------------------------------------- emit ----
 # Accumulates bench argument lines into CUR_RUNS, then writes one script.
@@ -260,6 +261,7 @@ add_run() {
             NSKIP=$(( NSKIP + 1 )); return 0
         fi
         extra="$extra --subsample $sub"
+        SUBSAMPLED_SETS="$SUBSAMPLED_SETS $dset"
         need=$(mem_bytes "$sub" "$d" "$k")
     fi
 
@@ -329,10 +331,6 @@ for row in "${LIBSVM_SETS[@]}"; do
     IFS='|' read -r id url bz name n d <<<"$row"
     path="$DATA/libsvm/$name"
     dense=$(( n * d * 4 ))
-    if [[ $DRY -eq 0 && $d -gt $RT_MAX_D && $dense -le $LIBSVM_DENSE_LIMIT ]]; then
-        printf '%s\t%s\t%s\t%s\t-\t-\t-\trt-base only: d > %s, (d+2)*u_16 >= 1; other 7 schemes run\n' \
-            libsvm "$id" "$n" "$d" "$RT_MAX_D" >> "$INFEAS"
-    fi
     for accum in fp32 fp16; do
       for z in 0 1; do
         zf=""; [[ $z == 1 ]] && zf=" --zscore"
@@ -369,10 +367,6 @@ for row in "${BIN_SETS[@]}"; do
     else
         n=$(awk -v i="$id" -F'\t' '$1==i {print $3}' "$DATA/manifest.tsv" 2>/dev/null || true)
         [[ -z "$n" ]] && { echo "  (skipping $id: not prepared and not in the manifest)"; continue; }
-    fi
-    if [[ $DRY -eq 0 && $d -gt $RT_MAX_D ]]; then
-        printf '%s\t%s\t%s\t%s\t-\t-\t-\trt-base only: d > %s, (d+2)*u_16 >= 1; other 7 schemes run\n' \
-            vector "$id" "$n" "$d" "$RT_MAX_D" >> "$INFEAS"
     fi
     for accum in fp32 fp16; do
       for z in 0 1; do
@@ -426,6 +420,16 @@ echo
 echo "jobs      : $NJOB"
 echo "runs      : $NRUN"
 echo "skipped   : $NSKIP  (see $INFEAS)"
+if [[ -n "$SUBSAMPLED_SETS" ]]; then
+    uniq_sets=$(echo "$SUBSAMPLED_SETS" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+    echo
+    echo "NOTE: these datasets are subsampled to fit: $uniq_sets"
+    echo "  mpkmeans_bench and rt_baseline_mp.py draw subsamples with different"
+    echo "  RNGs, so for these the rt-mp row clusters a DIFFERENT subset of the"
+    echo "  same file than the other schemes do.  Sizes and distributions match;"
+    echo "  the rows do not.  To make them identical, run the driver once with"
+    echo "  --dump-subsample and point both at that file with --bin."
+fi
 if [[ $DRY -eq 0 ]]; then
     echo
     echo "wrote $JOBS/*.sbatch and $OUT/run_all.sh"

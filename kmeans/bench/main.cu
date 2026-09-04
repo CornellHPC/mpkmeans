@@ -68,7 +68,9 @@ static void usage(const char* p) {
            "                 the SSE, since it rescales the space; a constant\n"
            "                 feature is left mean centred, not divided by 0\n"
            "  --convergence  iterate to convergence rather than a fixed count:\n"
-           "                 stop at max_j ||c_j - c_j_prev||_2 < tol, or at\n"
+           "                 stop at ||C - C_prev||_F < tol -- Frobenius over\n"
+           "                 the whole k x d centroid block, the same rule the\n"
+           "                 arXiv:2407.12208 package and cuVS use -- or at\n"
            "                 --maxiters, whichever comes first\n"
            "  --tol <float>  the tolerance above         (default 1e-8)\n"
            "  --theta <f>    rt-base safety factor of (4.13), must be > 2\n"
@@ -340,7 +342,7 @@ int main(int argc, char** argv) {
             printf("problem  : n=%d d=%d k=%d  blobs(std=%.3g, box=%.3g, "
                    "seed=%d)\n", n, d, k, blob_std, box, seed);
         if (converge)
-            printf("stopping : max_j ||c_j - c_j_prev||_2 < %.3g, or %d "
+            printf("stopping : ||C - C_prev||_F < %.3g, or %d "
                    "iterations\n", tol, max_iter);
         else
             printf("stopping : label stability, or %d iterations\n", max_iter);

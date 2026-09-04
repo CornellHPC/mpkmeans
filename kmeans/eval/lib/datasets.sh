@@ -56,8 +56,10 @@ max_n_for() {  # d k budget_bytes -> n
 # HOST before any subsampling, so it is a hard gate on n*d for LIBSVM sources.
 LIBSVM_DENSE_LIMIT=60000000000
 
-# The arXiv:2407.12208 baseline's error model is gamma_l(d+2) with u_l = 2^-11,
-# which is only defined while (d+2)*u_l < 1.  At or past this d, mpkMeansBaselineRT
-# declines the problem and the benchmark drops that one scheme -- the other
-# seven still run, so the job is not lost, but the rt-base row will be absent.
+# Our C++ rt-base could not run past d = 2045: its error model is gamma_l(d+2)
+# with u_l = 2^-11, defined only while (d+2)*u_l < 1.  That limit no longer
+# constrains the evaluation -- rt-base is --skip'd everywhere and the baseline
+# comes from the authors' own package, which carries no such restriction -- but
+# the constant is kept because mpkMeansBaselineRT still declines above it if
+# anyone runs it directly.
 RT_MAX_D=2045

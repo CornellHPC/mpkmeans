@@ -253,17 +253,22 @@ extern "C" mpkStatus mpkMeansFP32(cublasHandle_t blas, const float* dP, int n,
             mpkLaunchFinalizeCentroids(sums, counts, k, d, dC, moved2, s);
             t5.stop(s, &stats->t_update_ms);
 
-            /* convergence on the centroids: max_j ||c_j - c_j_prev||_2 < tol.
-             * k_finalize leaves the squared movements in moved2, so the
-             * comparison is done on the max of those and squared once, not
-             * rooted k times. */
+            /* Convergence on the centroids, Frobenius over the whole k x d
+             * block:  ||C - C_prev||_F < tol.  k_finalize leaves the squared
+             * per-centroid movements in moved2, so this is sum_j ||dc_j||^2 <
+             * tol^2 -- summed here, compared squared, no roots taken.
+             *
+             * Frobenius rather than the max over centroids because that is the
+             * rule the arXiv:2407.12208 authors' own package uses, and it is
+             * also exactly cuVS's centroid-shift clause; all three schemes now
+             * stop on the same quantity. */
             if (P.tol > 0.f) {
                 cudaMemcpyAsync(h_moved, moved2, (size_t)k * sizeof(float),
                                 cudaMemcpyDeviceToHost, s);
                 cudaStreamSynchronize(s);
-                float mx = 0.f;
-                for (int j = 0; j < k; ++j) mx = fmaxf(mx, h_moved[j]);
-                if (mx < P.tol * P.tol) break;
+                double fro2 = 0.0;
+                for (int j = 0; j < k; ++j) fro2 += (double)h_moved[j];
+                if (fro2 < (double)P.tol * (double)P.tol) break;
             }
             if (P.verbose)
                 fprintf(stderr, "[fp32] iter %3d  changed %lld\n", it, changed);
@@ -598,17 +603,22 @@ extern "C" mpkStatus mpkMeansMixed(cublasHandle_t blas,
              * complete and cudaEventElapsedTime would read back 0. */
             t6.stop_sync(s, &stats->t_update_ms);
 
-            /* convergence on the centroids: max_j ||c_j - c_j_prev||_2 < tol.
-             * k_finalize leaves the squared movements in moved2, so the
-             * comparison is done on the max of those and squared once, not
-             * rooted k times. */
+            /* Convergence on the centroids, Frobenius over the whole k x d
+             * block:  ||C - C_prev||_F < tol.  k_finalize leaves the squared
+             * per-centroid movements in moved2, so this is sum_j ||dc_j||^2 <
+             * tol^2 -- summed here, compared squared, no roots taken.
+             *
+             * Frobenius rather than the max over centroids because that is the
+             * rule the arXiv:2407.12208 authors' own package uses, and it is
+             * also exactly cuVS's centroid-shift clause; all three schemes now
+             * stop on the same quantity. */
             if (P.tol > 0.f) {
                 cudaMemcpyAsync(h_moved, moved2, (size_t)k * sizeof(float),
                                 cudaMemcpyDeviceToHost, s);
                 cudaStreamSynchronize(s);
-                float mx = 0.f;
-                for (int j = 0; j < k; ++j) mx = fmaxf(mx, h_moved[j]);
-                if (mx < P.tol * P.tol) break;
+                double fro2 = 0.0;
+                for (int j = 0; j < k; ++j) fro2 += (double)h_moved[j];
+                if (fro2 < (double)P.tol * (double)P.tol) break;
             }
         }
         tt.stop_sync(s, &stats->t_total_ms);

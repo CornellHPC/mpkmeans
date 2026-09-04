@@ -383,9 +383,9 @@ extern "C" mpkStatus mpkMeansBaselineRT(cublasHandle_t blas, const float* dP,
                 cudaMemcpyAsync(h_moved, moved2, (size_t)k * sizeof(float),
                                 cudaMemcpyDeviceToHost, s);
                 cudaStreamSynchronize(s);
-                float mx = 0.f;
-                for (int j = 0; j < k; ++j) mx = fmaxf(mx, h_moved[j]);
-                if (mx < P.tol * P.tol) break;
+                double fro2 = 0.0;
+                for (int j = 0; j < k; ++j) fro2 += (double)h_moved[j];
+                if (fro2 < (double)P.tol * (double)P.tol) break;
             }
         }
         tt.stop_sync(s, &stats->t_total_ms);

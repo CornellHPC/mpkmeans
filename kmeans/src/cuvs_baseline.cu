@@ -42,7 +42,7 @@
  * What could NOT be held fixed, and matters when reading the numbers:
  *
  *   stopping rule      ours halts when no label changed (and optionally when
- *                      max_j ||c_j - c_j_prev||_2 < tol).  cuVS halts when
+ *                      ||C - C_prev||_F < tol).  cuVS halts when
  *                      cost/prior_cost > 1 - tol OR sum_j ||c_j - c_j_prev||^2
  *                      < tol, and rejects tol <= 0, so it cannot be made to run
  *                      a fixed iteration count.  Both rules fire at true
@@ -178,9 +178,10 @@ extern "C" mpkStatus mpkMeansCuvs(cublasHandle_t blas, const float* dP, int n,
      * the bench's default mode our loop stops on label stability; the nearest
      * cuVS rule is "the cost stopped falling and the centroids stopped moving",
      * which is what a tol driven to the bottom of the float range gives.  With
-     * --convergence the bench sets P.tol on ||c_j - c_j_prev||_2; cuVS tests a
-     * SUM of SQUARED shifts against the same tol, so the comparable value is
-     * tol^2 (still stricter than our max, since a sum bounds a max). */
+     * --convergence the bench sets P.tol on ||C - C_prev||_F, and cuVS's shift
+     * clause is a SUM of SQUARED shifts -- the squared Frobenius norm of the
+     * same block.  So tol^2 here is not merely comparable to our rule, it is
+     * the same test written the other way round. */
     pr->tol = (P.tol > 0.f) ? (double)P.tol * (double)P.tol : 1e-30;
     /* one untiled pass over all n rows, matching our single n x k GEMM.
      * cuvs_batch > 0 asks for cuVS's own tiling instead (its default is 32768). */
