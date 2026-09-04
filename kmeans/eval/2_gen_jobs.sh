@@ -272,7 +272,7 @@ add_run() {
     # is fp16_fp32 whatever OUR --accum says, so it is emitted once, under the
     # fp32 arm, rather than duplicated across both.
     [[ "$extra" != *"--accum fp32"* ]] && return 0
-    local rt_extra="${extra//--convergence/}"
+    local rt_extra="$extra"
     rt_extra="${rt_extra//--dataset /--libsvm }"
     rt_extra="${rt_extra//--accum fp32/}"
     rt_extra="${rt_extra//--accum fp16/}"

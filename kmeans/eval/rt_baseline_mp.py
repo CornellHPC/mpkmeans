@@ -40,8 +40,9 @@ What is held equal to the C++ benchmark, and how:
 
 What cannot be held equal:
 
-  stopping      both stop on ||C - C_prev||_F < tol over the whole k x d
-                block.  The C++ side was moved onto that rule to match this
+  stopping      --convergence on both sides stops on ||C - C_prev||_F < tol
+                over the whole k x d block; without it both run exactly
+                --maxiters iterations and never exit early.  The C++ side was moved onto that rule to match this
                 package (and cuVS, whose shift clause is the same quantity),
                 so at equal --tol the two run the same recurrence to the same
                 point.  One residual difference: our loop also breaks when no
@@ -186,6 +187,15 @@ def main():
     ap.add_argument("-b", "--box", type=float, default=10.0, help="--blobs only")
     ap.add_argument("-e", "--seed", type=int, default=1)
     ap.add_argument("--maxiters", type=int, default=400)
+    ap.add_argument("--convergence", action="store_true",
+                    help="stop at ||C - C_prev||_F < --tol.  WITHOUT it the fit "
+                         "runs exactly --maxiters iterations, matching "
+                         "mpkmeans_bench without --convergence.  (The package "
+                         "rejects tol <= 0, so 'fixed count' is implemented as "
+                         "a subnormal tol: it can then only fire on an exactly "
+                         "zero centroid shift, i.e. on a fit that has stopped "
+                         "moving at all and whose further iterations would be "
+                         "no-ops anyway.)")
     ap.add_argument("--tol", type=float, default=1e-8)
     ap.add_argument("--kappa", type=float, default=5.0,
                     help="their safety factor, the paper's rho (default 5)")
@@ -270,16 +280,22 @@ def main():
           f"{'  (z-scored)' if args.zscore else ''}")
     print(f"kernel   : {args.kernel}  kappa={args.kappa}  init=random  "
           f"normalize=None")
-    print(f"stopping : ||C_new - C_old||_F < {args.tol:g}, or {args.maxiters} "
-          f"iterations")
+    if args.convergence:
+        print(f"stopping : ||C - C_prev||_F < {args.tol:g}, or {args.maxiters} "
+              f"iterations")
+    else:
+        print(f"stopping : none -- exactly {args.maxiters} iterations")
 
     # a first CUDA call pays for context setup and kernel load; keep that out
     # of the timed fit
     fit_once(X_t[: min(n, 4096)].contiguous(), C0_t, args.kernel, args.kappa,
              2, args.tol, args.seed)
 
+    # mirror mpkmeans_bench: --convergence enables the Frobenius test, and
+    # without it the fit runs the full --maxiters
+    eff_tol = args.tol if args.convergence else 1e-45
     model, ms = fit_once(X_t, C0_t, args.kernel, args.kappa, args.maxiters,
-                         args.tol, args.seed)
+                         eff_tol, args.seed)
     inert = inertia_fp64(X_t, model.cluster_centers_, model.labels_)
     print(f"{args.kernel:12s} iters={model.n_iter_:4d}  {ms:9.2f} ms  "
           f"inertia={inert:.9e}")
@@ -289,7 +305,7 @@ def main():
     label_diff = 0
     if args.reference == "fp32":
         rmodel, ref_ms = fit_once(X_t, C0_t, "fp32", args.kappa, args.maxiters,
-                                  args.tol, args.seed)
+                                  eff_tol, args.seed)
         ref_inert = inertia_fp64(X_t, rmodel.cluster_centers_, rmodel.labels_)
         ref_iters = rmodel.n_iter_
         label_diff = int((model.labels_ != rmodel.labels_).sum().item())

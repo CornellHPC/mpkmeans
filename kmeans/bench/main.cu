@@ -67,7 +67,10 @@ static void usage(const char* p) {
            "                 Algorithm 5.1 line 1).  Off by default.  Changes\n"
            "                 the SSE, since it rescales the space; a constant\n"
            "                 feature is left mean centred, not divided by 0\n"
-           "  --convergence  iterate to convergence rather than a fixed count:\n"
+           "  --convergence  iterate to convergence rather than a fixed count.\n"
+           "                 WITHOUT it the loop runs exactly --maxiters\n"
+           "                 iterations and never exits early, so every scheme\n"
+           "                 does the same amount of work.  With it:\n"
            "                 stop at ||C - C_prev||_F < tol -- Frobenius over\n"
            "                 the whole k x d centroid block, the same rule the\n"
            "                 arXiv:2407.12208 package and cuVS use -- or at\n"
@@ -337,7 +340,7 @@ int main(int argc, char** argv) {
             printf("stopping : ||C - C_prev||_F < %.3g, or %d "
                    "iterations\n", tol, max_iter);
         else
-            printf("stopping : label stability, or %d iterations\n", max_iter);
+            printf("stopping : none -- exactly %d iterations\n", max_iter);
         printf("gemm     : FP16 operands, %s accumulate\n",
                accum == MPK_ACCUM_FP16 ? "FP16" : "FP32");
         printf("eps      : %.6e   ->  factor 2*eps/(1-eps) = %.6e\n",

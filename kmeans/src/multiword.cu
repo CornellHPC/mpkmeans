@@ -568,7 +568,19 @@ extern "C" mpkStatus mpkMeansMultiword(cublasHandle_t blas, const float* dP,
             stats->iters = it + 1;
             if (P.verbose)
                 fprintf(stderr, "[mw] iter %3d  changed %8lld\n", it, changed);
-            if (changed == 0) break;
+            /* No early exit on label stability.  Without --convergence the loop
+             * runs exactly max_iter iterations, which is what makes a fixed
+             * iteration count mean the same thing here and in the mp-kmeans
+             * driver; with it, the only stopping rule is the Frobenius test
+             * below -- the rule that package and cuVS also use.  A
+             * label-stability break on top of that fired at a completely
+             * different point for the low precision schemes than for FP32
+             * (coarse distances stop flipping marginal points early), so runs
+             * of different lengths were being compared as if equal.
+             *
+             * `changed` is still computed: it is what --verbose prints, and
+             * keeping the memcpy and sync leaves the loop's synchronisation
+             * structure, and hence its timings, unchanged. */
 
             /* ---- centroid update (excluded from t_dist_ms) ---------------- */
             t6.start(s);
