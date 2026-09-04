@@ -156,13 +156,29 @@ argmin wrong where the fallback gets none). The fallback uses the direct
 formula, which does not cancel; `pairwise_euclidean_single` uses the expanded
 one, which does.
 
-**But the clustering barely notices.** Over full 20-iteration fits from shared
-centroids, relative inertia against their fp32 sits at 2e-06 to 9e-06 for every
-kappa from 0 to 1e6, with no trend, and label disagreement only falls from
-0.51% to 0.33%. At kappa = 0 just 0.047% of points get the wrong nearest
-centroid per iteration, and Lloyd's absorbs that. The reliability test does
-exactly what it claims at the kernel level; the outer loop is robust enough that
-you are paying 9x to 31x for something the clustering mostly does not need.
+**But the clustering barely notices, and a single-seed sweep cannot even see
+it.** Over full 20-iteration fits from one shared set of centroids the trend is
+real but tiny: inertia falls slightly from kappa 0 to 3 and, from kappa 5 on,
+matches the fp32 run to ten digits -- which is what the kernel table predicts,
+since argmin errors reach zero at 5. The trouble is the size of it:
+
+| | spread in final inertia |
+| --- | --- |
+| vary kappa 0 -> 1e6, same starting centroids | 7.5e-05 |
+| fix kappa = 5, vary starting centroids (8 seeds) | **3.6e-03** |
+
+Choosing a different 64 starting points moves the answer **48x more** than
+sweeping kappa over its whole range, so one seed reads a quantity far below its
+own noise floor -- which is why the first sweep here showed sign flips and no
+order. To measure kappa end to end, average over ~20 initialisations; to
+measure the kernel, do not cluster at all (`kappa_kernel.py`).
+
+The substantive point survives either way. At kappa = 0 only 0.047% of points
+get the wrong nearest centroid per iteration and Lloyd's absorbs that; label
+disagreement against fp32 falls only from 0.51% to 0.33% across the entire
+kappa range. The reliability test does exactly what it claims at the kernel
+level, and the outer loop is robust enough that you are paying 9x to 31x for
+accuracy the clustering mostly does not need.
 
 ### run_one.sh — one problem, both implementations, identical inputs
 
