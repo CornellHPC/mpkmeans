@@ -455,8 +455,15 @@ int main(int argc, char** argv) {
     /* cuvs is a row only when the library was built against RAPIDS; without it
      * the driver is a stub, so the row is dropped everywhere rather than
      * reported as a failure. */
+    /* A scheme can decline a problem outright rather than fail on it: the
+     * arXiv baseline's error model needs (d+2)*u_16 < 1, so it is undefined
+     * for d >= 2046 and says so.  That is a fact about the scheme, not a
+     * broken run, and it must not take the other seven down with it -- the
+     * config is dropped from the tables and the CSV and the rest proceed. */
+    std::vector<char> cfg_ran(MPK_NCFG, 1);
     auto skip = [&](int c) {
         if (only >= 0 && only != c) return true;
+        if (!cfg_ran[c]) return true;
         return kConfigs[c].driver == 3 && !mpkHaveCuvs();
     };
     std::vector<std::vector<int>> amix(MPK_NCFG, std::vector<int>(n));
@@ -487,8 +494,19 @@ int main(int argc, char** argv) {
                                    &smix[c])
                     : mpkMeansMixed(blas, dP, n, d, k, dCmix, dAmix, &par,
                                     &smix[c]);
+            if (rc == MPK_ERR_INVALID) {
+                fprintf(stderr, "%s: declined this problem (n=%d d=%d k=%d) "
+                                "-- dropped from this run\n",
+                        kConfigs[c].name, n, d, k);
+                if (kConfigs[c].driver == 1 && (double)(d + 2) * 4.8828125e-4 >= 1.0)
+                    fprintf(stderr, "  rt-base needs (d+2)*u_16 < 1, i.e. "
+                                    "d < 2046; this d is %d\n", d);
+                cfg_ran[c] = 0;
+                break;
+            }
             if (rc != MPK_OK) {
-                fprintf(stderr, "mixed %s failed\n", kConfigs[c].name);
+                fprintf(stderr, "mixed %s failed (status %d)\n",
+                        kConfigs[c].name, (int)rc);
                 return 1;
             }
         }

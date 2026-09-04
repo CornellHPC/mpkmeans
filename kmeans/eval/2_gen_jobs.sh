@@ -287,6 +287,10 @@ for row in "${LIBSVM_SETS[@]}"; do
     IFS='|' read -r id url bz name n d <<<"$row"
     path="$DATA/libsvm/$name"
     dense=$(( n * d * 4 ))
+    if [[ $DRY -eq 0 && $d -gt $RT_MAX_D && $dense -le $LIBSVM_DENSE_LIMIT ]]; then
+        printf '%s\t%s\t%s\t%s\t-\t-\t-\trt-base only: d > %s, (d+2)*u_16 >= 1; other 7 schemes run\n' \
+            libsvm "$id" "$n" "$d" "$RT_MAX_D" >> "$INFEAS"
+    fi
     for accum in fp32 fp16; do
       for z in 0 1; do
         zf=""; [[ $z == 1 ]] && zf=" --zscore"
@@ -323,6 +327,10 @@ for row in "${BIN_SETS[@]}"; do
     else
         n=$(awk -v i="$id" -F'\t' '$1==i {print $3}' "$DATA/manifest.tsv" 2>/dev/null || true)
         [[ -z "$n" ]] && { echo "  (skipping $id: not prepared and not in the manifest)"; continue; }
+    fi
+    if [[ $DRY -eq 0 && $d -gt $RT_MAX_D ]]; then
+        printf '%s\t%s\t%s\t%s\t-\t-\t-\trt-base only: d > %s, (d+2)*u_16 >= 1; other 7 schemes run\n' \
+            vector "$id" "$n" "$d" "$RT_MAX_D" >> "$INFEAS"
     fi
     for accum in fp32 fp16; do
       for z in 0 1; do

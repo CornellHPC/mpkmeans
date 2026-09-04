@@ -55,3 +55,9 @@ max_n_for() {  # d k budget_bytes -> n
 # mpkLoadLibsvm refuses to densify beyond 6e10 bytes, and that happens on the
 # HOST before any subsampling, so it is a hard gate on n*d for LIBSVM sources.
 LIBSVM_DENSE_LIMIT=60000000000
+
+# The arXiv:2407.12208 baseline's error model is gamma_l(d+2) with u_l = 2^-11,
+# which is only defined while (d+2)*u_l < 1.  At or past this d, mpkMeansBaselineRT
+# declines the problem and the benchmark drops that one scheme -- the other
+# seven still run, so the job is not lost, but the rt-base row will be absent.
+RT_MAX_D=2045

@@ -56,6 +56,11 @@ Two consequences worth knowing before reading any result:
   densifies to the largest feature index — 108 GB, past its own 60 GB ceiling,
   on the host, at load time, before subsampling could help. Row count is not
   the problem; the index space is.
+- **rt-base is absent for wiki, Wiki10-31K and real-sim.** Its error model is
+  `gamma_l(d+2)` with `u_l = 2^-11`, defined only while `(d+2)·u_l < 1`, i.e.
+  `d < 2046`; those three are 3072, 101,938 and 20,958. The scheme declines the
+  problem, the benchmark drops that one row and runs the other seven. epsilon
+  at d=2000 clears the limit with almost nothing to spare.
 - **mnist8m is always subsampled**, to between 1.9M and 3.5M of its 8.1M rows
   depending on k. The subsample is recorded in the CSV's `n` column, so the
   plots show what was actually clustered.
