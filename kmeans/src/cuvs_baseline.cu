@@ -67,12 +67,10 @@
  *                      convergence test and its own bookkeeping are inside it
  *                      and cannot be separated.  t_total_ms is that call and is
  *                      the only number directly comparable to another
- *                      implementation.  t_dist_ms is a single assignment pass,
- *                      measured separately via cuvsKMeansPredict and multiplied
- *                      by the iteration count, so that the per-iteration
- *                      distance-step column has something in it; that pass also
- *                      computes an inertia our own loop would not, so it reads
- *                      slightly high.
+ *                      implementation, and the only timing this driver reports.
+ *                      There is no honest per-stage decomposition to give: the
+ *                      predict call this makes for the labels is not an
+ *                      assignment pass in disguise (see t_dist_ms below).
  *   empty clusters     cuVS reinitialises them; our finalize leaves them where
  *                      they are.  With random-point init on separated data
  *                      neither fires, but on a degenerate dataset they diverge.
@@ -214,7 +212,17 @@ extern "C" mpkStatus mpkMeansCuvs(cublasHandle_t blas, const float* dP, int n,
 
     stats->iters       = n_iter;
     stats->t_total_ms  = fit_ms;
-    stats->t_dist_ms   = (double)pred_ms * (double)(n_iter > 0 ? n_iter : 1);
+    /* t_dist_ms is left 0: NOT MEASURED, rather than zero.
+     *
+     * This used to hold one timed cuvsKMeansPredict scaled by the iteration
+     * count, on the theory that a predict pass is an assignment pass.  It is
+     * not: a standalone predict allocates its own workspace and computes an
+     * inertia the fit's inner loop does not, and at 30 iterations the
+     * extrapolation came to 490 ms against a fit that took 62.  A number that
+     * wrong is worse than no number, so the stage columns read "-" for this
+     * row and t_total_ms -- the whole fit, which IS measured -- is the only
+     * timing it reports. */
+    stats->t_dist_ms   = 0.0;
     /* every pair is evaluated, every one of them in FP32: no exclusion, so the
      * "eliminated" column is 0 by construction rather than by measurement */
     stats->hp_baseline = (long long)n * k * (n_iter > 0 ? n_iter : 1);

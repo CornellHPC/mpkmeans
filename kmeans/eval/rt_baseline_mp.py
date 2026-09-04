@@ -37,6 +37,10 @@ What is held equal to the C++ benchmark, and how:
   inertia       recomputed in FP64 from the final centers and labels, the same
                 quantity mpkmeans_bench reports -- not their inertia_, which is
                 a mixed-precision sum in whatever space the model was fitted.
+                The chosen kernel is then scored against this package's own
+                fp32 kernel run on the same data from the same centroids
+                through the same loop, so the relative inertia difference
+                isolates the distance kernel and nothing else.
 
 What cannot be held equal:
 
@@ -213,13 +217,14 @@ def main():
     ap.add_argument("--dump-centroids",
                     help="write the initial centroids, for mpkmeans_bench "
                          "--init-centroids")
-    ap.add_argument("--reference", choices=["fp32", "none"], default="none",
-                    help="also fit with their uniform-fp32 kernel from the same "
-                         "centroids, filling the *_fp32 columns.  Off by "
-                         "default: those columns would then hold THIS package's "
-                         "fp32, not mpkMeansFP32, which is a different "
-                         "reference from every other row's and doubles the "
-                         "runtime for a number the plots do not use.")
+    ap.add_argument("--reference", choices=["fp32", "none"], default="fp32",
+                    help="fit the same data from the same centroids with this "
+                         "package's fp32 kernel, and report the chosen "
+                         "kernel's inertia relative to it.  That is the "
+                         "controlled comparison -- same loop, same data, same "
+                         "start, only the distance kernel differs.  --reference "
+                         "none skips it and halves the runtime, leaving "
+                         "rel_inertia unset.")
     ap.add_argument("--csv", help="append a row here (header written if new)")
     ap.add_argument("--csv-header", action="store_true",
                     help="print the CSV header and exit")
@@ -303,7 +308,13 @@ def main():
     ref_ms = ref_iters = 0.0
     ref_inert = float("nan")
     label_diff = 0
-    if args.reference == "fp32":
+    rel = float("nan")
+    if args.kernel in ("fp32", "fp32_uniform") and args.reference == "fp32":
+        # the chosen kernel IS the reference; refitting it would only measure
+        # this package's own run-to-run noise
+        print("rel inertia vs fp32: 0 by construction (--kernel is fp32)")
+        ref_inert, ref_ms, ref_iters, rel = inert, ms, model.n_iter_, 0.0
+    elif args.reference == "fp32":
         rmodel, ref_ms = fit_once(X_t, C0_t, "fp32", args.kappa, args.maxiters,
                                   eff_tol, args.seed)
         ref_inert = inertia_fp64(X_t, rmodel.cluster_centers_, rmodel.labels_)
@@ -312,10 +323,13 @@ def main():
         print(f"{'fp32':12s} iters={rmodel.n_iter_:4d}  {ref_ms:9.2f} ms  "
               f"inertia={ref_inert:.9e}")
         rel = abs(inert - ref_inert) / max(abs(ref_inert), 1e-300)
-        print(f"rel inertia vs their own fp32: {rel:.3e}   "
-              f"labels differing: {label_diff} ({100.0*label_diff/n:.3f}%)")
-    else:
-        rel = float("nan")
+        signed = (inert - ref_inert) / max(abs(ref_inert), 1e-300)
+        print(f"\n  {args.kernel} vs fp32 (same package, same data, same "
+              f"centroids, same loop):")
+        print(f"    rel inertia diff : {rel:.3e}  ({signed:+.3e} signed -- "
+              f"{'worse' if signed > 0 else 'better'} than fp32)")
+        print(f"    labels differing : {label_diff} of {n} "
+              f"({100.0*label_diff/n:.3f}%)")
 
     if truth is not None:
         print(f"(synthetic: {args.k} planted clusters; blobs are "
