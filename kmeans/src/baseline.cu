@@ -22,11 +22,37 @@
  *     accept the expanded value  iff  D_lo(i,j) > theta * E_l(p,c),
  *     otherwise recompute by the direct formula in FP32.
  *
- * theta is their safety factor (their tilde-theta), required > 2, and set to 5
- * in all of their experiments -- which is mpkParams::rt_theta's default here.
- * By (4.14) it controls the relative error: accepted entries are good to
- * 1/(theta-1), and 2/(theta-2) against the unquantized distance.  This is
- * their FP16->FP32 variant, one of the two they report as the best trade-off.
+ * theta plays the role of their safety factor (their tilde-rho), required > 2.
+ * Its default here is 2.5, and that number needs justifying, because the paper
+ * is internally inconsistent about it:
+ *
+ *   - Section 4.3's analysis defines E^l(x~,y~) := 2 * gamma^l_{r+2} *
+ *     (||x~||^2 + ||y~||^2) and states the test as d^l_r,exp > rho~ * E^l,
+ *     which is (4.13).  `efac` below is that definition, factor of 2 included.
+ *   - Algorithm 4.1, the boxed pseudocode for the mixed precision distance
+ *     computation that the k-means loop (Algorithm 5.1) actually calls, writes
+ *     the same test at its line 7 as E <- fl_l( rho * gamma^l_{r+2} *
+ *     (dxx + dyy) ) -- with no factor of 2.
+ *   - The running text of Section 6.1 says "the safety factors in the fallback
+ *     rules (4.7) and (4.18) are set to rho = rho~ = 5".
+ *
+ * So for the same named rho = 5 the two readings differ by exactly a factor of
+ * 2 in the threshold.  Read against (4.13), which is what this file implements,
+ * the prose would put theta at 5.  We default to 2.5 instead, which reproduces
+ * Algorithm 4.1's literal threshold at its own stated rho = 5: the boxed
+ * pseudocode is the executable specification, and so the reading another
+ * reimplementation of this paper is most likely to have transcribed.  Both
+ * readings are defensible; this is a choice, and `--theta` overrides it.
+ *
+ * By (4.14) theta controls the relative error of what is accepted: entries that
+ * pass are good to 1/(theta-1) and to 2/(theta-2) against the unquantized
+ * distance.  At the default theta = 2.5 those are 2/3 and 4 -- loose bounds,
+ * and much looser than the 1/4 and 2/3 the prose reading's theta = 5 would give.
+ * The bounds are worst case; what actually changes is the fallback rate, which
+ * is what the benchmark measures.  Note the direction: a smaller theta is a
+ * lower threshold, so MORE entries pass the test and FEWER fall back to the
+ * direct formula.  This is their FP16->FP32 variant, one of the two they report
+ * as the best trade-off.
  *
  * One deliberate deviation: the norms are taken from the FP32 P and C rather
  * than from their FP16 images.  Their (4.12) bounds the difference by a factor
@@ -200,8 +226,9 @@ extern "C" mpkStatus mpkMeansBaselineRT(cublasHandle_t blas, const float* dP,
 #ifdef MPK_STATS
     stats->stats_built = 1;
 #endif
-    /* the paper's safety factor: > 2 required, 5 used throughout their tests */
-    float theta = P.rt_theta > 0.f ? P.rt_theta : 5.0f;
+    /* the paper's safety factor: > 2 required.  2.5 by default -- see the
+     * file comment above for why that, and not the 5 their prose names. */
+    float theta = P.rt_theta > 0.f ? P.rt_theta : 2.5f;
     /* the computable error floor E_l, less the (||p||^2 + ||c||^2) factor */
     const double u_l   = 4.8828125e-4;             /* FP16 unit roundoff, 2^-11 */
     const double md    = (double)d + 2.0;

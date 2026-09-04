@@ -94,9 +94,12 @@ typedef struct {
                            * actually tracks: measured ~0.20 at k=32, ~0.33 at
                            * k=128, ~0.70 at k=256                              */
     float rt_theta;       /* baseline only (mpkMeansBaselineRT): the safety
-                           * factor of arXiv:2407.12208 (4.13).  Must be > 2;
-                           * they use 5 throughout, which is the default when
-                           * this is <= 0.                                     */
+                           * factor of arXiv:2407.12208 (4.13).  Must be > 2.
+                           * <= 0 selects the default, 2.5, which reproduces
+                           * their Algorithm 4.1's literal threshold at its
+                           * stated rho = 5 -- the paper states that constant
+                           * two inconsistent ways, and the reasoning for the
+                           * choice is in the src/baseline.cu file comment.    */
     int   verify;         /* per-iteration FP64 oracle check (MPK_STATS only)  */
     int   verbose;        /* per-iteration log to stdout                       */
 } mpkParams;
