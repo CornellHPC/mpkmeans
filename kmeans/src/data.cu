@@ -163,3 +163,49 @@ extern "C" mpkStatus mpkLoadLibsvm(const char* path, int* out_n, int* out_d,
     if (out_nclasses) *out_nclasses = (int)classes.size();
     return MPK_OK;
 }
+
+/* Load a headerless float32 matrix -- the form SuperKMeans' setup_data.py
+ * writes, and the form scripts/fetch_superkmeans_datasets.sh reproduces.
+ *
+ * There is nothing in the file but n*d float32 in row major order, so `d` has
+ * to come from the caller (manifest.tsv next to the data records it) and n is
+ * whatever the file size implies.  A size that is not a whole number of rows
+ * means the dimension is wrong or the file is truncated, and is refused rather
+ * than silently reinterpreted.
+ *
+ * These datasets carry no label column, so there is no ground truth to return
+ * and the caller gets none -- unlike the LIBSVM path, where the label is the
+ * first field of every row. */
+extern "C" mpkStatus mpkLoadBin(const char* path, int d, long long max_rows,
+                                int* out_n, float** out_P) {
+    if (!path || d <= 0 || !out_n || !out_P) return MPK_ERR_INVALID;
+    FILE* f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "cannot open %s\n", path); return MPK_ERR_INVALID; }
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return MPK_ERR_INVALID; }
+    const long long bytes = ftello(f);
+    rewind(f);
+
+    const long long row_bytes = (long long)d * (long long)sizeof(float);
+    if (bytes <= 0 || bytes % row_bytes != 0) {
+        fprintf(stderr, "%s: %lld bytes is not a whole number of %d-dim float32 "
+                        "rows (%lld bytes each) -- wrong --dim, or truncated\n",
+                path, bytes, d, row_bytes);
+        fclose(f); return MPK_ERR_INVALID;
+    }
+    long long rows = bytes / row_bytes;
+    if (max_rows > 0 && max_rows < rows) rows = max_rows;   /* prefix only */
+    if (rows > INT_MAX) { fclose(f); return MPK_ERR_INVALID; }
+
+    float* P = (float*)malloc((size_t)rows * d * sizeof(float));
+    if (!P) { fclose(f); return MPK_ERR_ALLOC; }
+    const size_t want = (size_t)rows * d;
+    const size_t got  = fread(P, sizeof(float), want, f);
+    fclose(f);
+    if (got != want) {
+        fprintf(stderr, "%s: read %zu of %zu floats\n", path, got, want);
+        free(P); return MPK_ERR_INVALID;
+    }
+    *out_n = (int)rows;
+    *out_P = P;
+    return MPK_OK;
+}

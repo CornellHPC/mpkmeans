@@ -313,6 +313,21 @@ double mpkMultiwordEpsilon(int d, int macs);
  * *out_labels (n ints, the label column renumbered 0..nclasses-1 in order of
  * first appearance) are malloc'd and belong to the caller.  out_labels and
  * out_nclasses may be NULL.  The label count is NOT assumed to be k. */
+/* Load a headerless row-major float32 matrix (the SuperKMeans vector-indexing
+ * layout: see scripts/fetch_superkmeans_datasets.sh, which writes the shape to
+ * a manifest because the file itself does not carry it).
+ *
+ *   d          the dimension; nothing in the file says what it is
+ *   max_rows   read at most this many rows (<= 0 for all).  A prefix, not a
+ *              sample -- for a sample use the benchmark's --subsample, which
+ *              draws without replacement.
+ *   out_n      rows actually read
+ *   out_P      malloc'd n x d, caller frees
+ *
+ * There is no label column in this format, so there is no ground truth. */
+mpkStatus mpkLoadBin(const char* path, int d, long long max_rows,
+                     int* out_n, float** out_P);
+
 mpkStatus mpkLoadLibsvm(const char* path, int* out_n, int* out_d,
                         float** out_P, int** out_labels, int* out_nclasses);
 

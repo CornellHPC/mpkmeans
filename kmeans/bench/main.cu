@@ -20,6 +20,7 @@
 #include <cmath>
 #include <vector>
 #include <algorithm>
+#include <random>
 
 #define CHK(call)                                                             \
     do {                                                                      \
@@ -44,6 +45,17 @@ static void usage(const char* p) {
            "  -r <int>       timed repeats, last wins   (default 1)\n"
            "  --dataset <f>  LIBSVM file instead of blobs; n and d come from\n"
            "                 the file and -n/-d are ignored\n"
+           "  --bin <f>      headerless row-major float32 matrix instead of\n"
+           "                 blobs (the SuperKMeans vector-indexing layout).\n"
+           "                 -d gives the dimension -- the file does not carry\n"
+           "                 it -- and n follows from the file size.  There is\n"
+           "                 no label column, so no ground truth agreement\n"
+           "  --subsample <n>  cluster a random n-row subset of the loaded\n"
+           "                 dataset, drawn without replacement with -e as the\n"
+           "                 seed.  For datasets that do not fit otherwise:\n"
+           "                 the benchmark holds P twice on the device (shifted\n"
+           "                 and unshifted), so the ceiling is well under the\n"
+           "                 card.  Ignored for blobs, where -n already says it\n"
            "  --zscore       z-score normalize every feature of P before any\n"
            "                 scheme sees it, as arXiv:2407.12208 does (their\n"
            "                 Algorithm 5.1 line 1).  Off by default.  Changes\n"
@@ -170,6 +182,8 @@ int main(int argc, char** argv) {
     float mw_gather_frac = 0.f;     /* multiword: 0 = derive from k */
     int   zscore = 0;               /* --zscore: standardize P up front */
     int   cuvs_batch = 0;           /* cuvs: 0 = n, one untiled pass    */
+    const char* binset = nullptr;   /* --bin: raw float32 matrix        */
+    long long subsample = 0;        /* --subsample: 0 = whole dataset   */
 
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
@@ -185,6 +199,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "-i") || !strcmp(a, "--maxiters"))
             max_iter = atoi(next());
         else if (!strcmp(a, "--dataset")) dataset = next();
+        else if (!strcmp(a, "--bin")) binset = next();
+        else if (!strcmp(a, "--subsample")) subsample = atoll(next());
         else if (!strcmp(a, "--convergence")) converge = 1;
         else if (!strcmp(a, "--zscore")) zscore = 1;
         else if (!strcmp(a, "--cuvs-batch")) cuvs_batch = atoi(next());
@@ -212,12 +228,12 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "-v")) verbose = 1;
         else if (!strcmp(a, "--csv")) csv = 1;
         else if (!strcmp(a, "--csv-header")) {
-            printf("n,d,k,std,seed,zscore,cond,iters,eps,"
+            printf("dataset,n,d,k,std,box,seed,zscore,accum,cond,iters,eps,"
                    "hp_baseline,hp_reference,hp_update,hp_total,pct_eliminated,"
                    "pct_reference,pct_update,pct_cond3,pct_cond6,pct_cond3_only,"
                    "pct_cond6_only,violations,label_diff,inertia,inertia_fp32,"
                    "rel_inertia,ms_dist,ms_dist_fp32,speedup,ms_prep,ms_gemm,"
-                   "ms_argmin,ms_hpupdate,ms_assign\n");
+                   "ms_argmin,ms_hpupdate,ms_assign,ms_total,ms_total_fp32,iters_fp32\n");
             return 0;
         }
         else { usage(argv[0]); return 1; }
@@ -231,14 +247,54 @@ int main(int argc, char** argv) {
     /* A dataset defines n and d -- only the file knows them -- so it is read
      * before anything that depends on the shape, and -n/-d are ignored. */
     float* hP = nullptr;
-    std::vector<int> hTruth;
+    std::vector<int> hTruth;      /* empty when the source carries no labels */
     int n_truth_classes = k;
+    if (dataset && binset) {
+        fprintf(stderr, "--dataset and --bin are alternatives; pick one\n");
+        return 1;
+    }
     if (dataset) {
         int fn = 0, fd = 0, nc = 0; int* lab = nullptr;
         if (mpkLoadLibsvm(dataset, &fn, &fd, &hP, &lab, &nc) != MPK_OK) return 1;
         n = fn; d = fd; n_truth_classes = nc;
         hTruth.assign(lab, lab + n);
         free(lab);
+    } else if (binset) {
+        int fn = 0;
+        if (mpkLoadBin(binset, d, 0, &fn, &hP) != MPK_OK) return 1;
+        n = fn;                   /* d came from -d; the file has no header */
+        n_truth_classes = 0;      /* no label column in this format */
+    }
+
+    /* Subsampling happens here, on the host, before anything is sized from n:
+     * the point is to fit a dataset that otherwise would not, so it has to
+     * happen before the device allocations, not after.  Without replacement,
+     * seeded by -e, and the rows are kept in file order so the result is a
+     * subset of the dataset rather than a reshuffling of it. */
+    if ((dataset || binset) && subsample > 0 && subsample < (long long)n) {
+        const int m = (int)subsample;
+        std::vector<int> idx(n);
+        for (int i = 0; i < n; ++i) idx[i] = i;
+        std::mt19937 rng((unsigned)seed);
+        for (int i = 0; i < m; ++i) {              /* partial Fisher-Yates */
+            std::uniform_int_distribution<int> pick(i, n - 1);
+            std::swap(idx[i], idx[pick(rng)]);
+        }
+        idx.resize(m);
+        std::sort(idx.begin(), idx.end());         /* keep file order */
+        float* sub = (float*)malloc((size_t)m * d * sizeof(float));
+        if (!sub) { fprintf(stderr, "out of host memory subsampling\n"); return 1; }
+        std::vector<int> tsub;
+        if (!hTruth.empty()) tsub.resize(m);
+        for (int i = 0; i < m; ++i) {
+            memcpy(sub + (size_t)i * d, hP + (size_t)idx[i] * d,
+                   (size_t)d * sizeof(float));
+            if (!hTruth.empty()) tsub[i] = hTruth[idx[i]];
+        }
+        free(hP); hP = sub;
+        hTruth.swap(tsub);
+        if (!csv) printf("subsample: %d of %d rows, seed %d\n", m, n, seed);
+        n = m;
     }
     if (n <= 0 || d <= 0 || k <= 0 || k > n) { usage(argv[0]); return 1; }
 
@@ -252,7 +308,10 @@ int main(int argc, char** argv) {
     }
     if (!csv) {
         printf("device   : %s (sm_%d%d)\n", prop.name, prop.major, prop.minor);
-        if (dataset)
+        if (binset)
+            printf("problem  : n=%d d=%d k=%d  %s (raw float32, no labels)\n",
+                   n, d, k, binset);
+        else if (dataset)
             printf("problem  : n=%d d=%d k=%d  %s (%d classes in the label "
                    "column)\n", n, d, k, dataset, n_truth_classes);
         else
@@ -271,7 +330,7 @@ int main(int argc, char** argv) {
     }
 
     /* ------------------------------------------------------------ data --- */
-    if (!dataset) {
+    if (!dataset && !binset) {
         hP = (float*)malloc((size_t)n * d * sizeof(float));
         if (!hP) { fprintf(stderr, "out of host memory\n"); return 1; }
         hTruth.resize(n);
@@ -381,6 +440,17 @@ int main(int argc, char** argv) {
     CHK(cudaMemcpy(aref.data(), dAref, (size_t)n * sizeof(int),
                    cudaMemcpyDeviceToHost));
 
+    /* the CSV has to say what was clustered: a results file that records the
+     * shape but not the source, the separation or the accumulator cannot be
+     * plotted against any of them.  Basename only -- the path is the caller's
+     * business and would not survive being moved. */
+    const char* csv_src = binset ? binset : dataset;
+    const char* csv_dataset = "blobs";
+    if (csv_src) {
+        const char* slash = strrchr(csv_src, '/');
+        csv_dataset = slash ? slash + 1 : csv_src;
+    }
+
     int ok = 1;
     /* cuvs is a row only when the library was built against RAPIDS; without it
      * the driver is a stub, so the row is dropped everywhere rather than
@@ -439,13 +509,14 @@ int main(int argc, char** argv) {
         ok = ok && cok;
 
         if (csv) {
-            printf("%d,%d,%d,%g,%d,%d,%s,%d,%.6e,"
+            printf("%s,%d,%d,%d,%g,%g,%d,%d,%s,%s,%d,%.6e,"
                    "%lld,%lld,%lld,%lld,%.6f,%.6f,%.6f,"
                    "%.6f,%.6f,%.6f,%.6f,%lld,%lld,"
                    "%.9e,%.9e,%.3e,%.3f,%.3f,%.4f,"
-                   "%.3f,%.3f,%.3f,%.3f,%.3f\n",
-                   n, d, k, blob_std, seed, zscore, kConfigs[c].name,
-                   S.iters, eps,
+                   "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d\n",
+                   csv_dataset, n, d, k, blob_std, box, seed, zscore,
+                   accum == MPK_ACCUM_FP16 ? "fp16" : "fp32",
+                   kConfigs[c].name, S.iters, eps,
                    S.hp_baseline, S.hp_reference, S.hp_update, hp,
                    100.0 * (1.0 - (double)hp / base),
                    100.0 * (double)S.hp_reference / base,
@@ -459,7 +530,12 @@ int main(int argc, char** argv) {
                    S.t_dist_ms, sref.t_dist_ms,
                    sref.t_dist_ms / fmax(S.t_dist_ms, 1e-9),
                    S.t_prep_ms, S.t_gemm_lo_ms, S.t_argmin_ms,
-                   S.t_hp_update_ms, S.t_assign_ms);
+                   S.t_hp_update_ms, S.t_assign_ms,
+                   /* the whole fit, the only column cuvs can be held to */
+                   S.t_total_ms, sref.t_total_ms,
+                   /* the schemes converge in different numbers of iterations,
+                    * so the fp32 totals are meaningless without this */
+                   sref.iters);
         }
     }
     if (csv) {
@@ -713,6 +789,10 @@ int main(int argc, char** argv) {
         printf("  -- SKIPPED: --no-verify\n");
     }
 
+    /* --bin datasets have no label column, so there is no ground truth to
+     * agree with and the column is left blank rather than filled with a
+     * meaningless 0. */
+    const bool have_truth = !hTruth.empty() && n_truth_classes > 0;
     printf("\nclustering\n");
     for (int c = 0; c < MPK_NCFG; ++c) {
         if (skip(c)) continue;
@@ -721,13 +801,17 @@ int main(int argc, char** argv) {
         for (int i = 0; i < n; ++i) identical += (amix[c][i] == aref[i]);
         const double rel = fabs(S.inertia - sref.inertia) /
                            fmax(sref.inertia, 1e-300);
-        printf("  %-8s inertia rel diff %.3e   labels == fp32 %.3f%%   "
-               "truth %.4f\n", kConfigs[c].name, rel,
-               100.0 * (double)identical / n,
-               label_agreement(amix[c], hTruth, k, n_truth_classes));
+        printf("  %-8s inertia rel diff %.3e   labels == fp32 %.3f%%   ",
+               kConfigs[c].name, rel, 100.0 * (double)identical / n);
+        if (have_truth)
+            printf("truth %.4f\n",
+                   label_agreement(amix[c], hTruth, k, n_truth_classes));
+        else
+            printf("truth %6s\n", "-");
     }
-    printf("  %-8s %54s truth %.4f\n", "fp32", "",
-           label_agreement(aref, hTruth, k, n_truth_classes));
+    if (have_truth)
+        printf("  %-8s %54s truth %.4f\n", "fp32", "",
+               label_agreement(aref, hTruth, k, n_truth_classes));
 
     /* The theorem guarantees the true nearest centroid is never filtered out.
      * It does not guarantee bit-identical labels to an FP32 run: once an FP32
