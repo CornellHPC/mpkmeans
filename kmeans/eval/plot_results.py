@@ -24,11 +24,12 @@ import matplotlib.pyplot as plt
 
 # the mixed-precision schemes, in the order they should appear in a legend
 CONDS = ["(3)", "(6)", "(3)+(6)", "(3)->(6)", "raw", "mw", "rt-base", "cuvs",
-         "rt-mp"]
+         "rt-mp-k1", "rt-mp-k5"]
 COLORS = {
     "(3)": "#4c72b0", "(6)": "#dd8452", "(3)+(6)": "#55a868",
     "(3)->(6)": "#c44e52", "raw": "#8172b3", "mw": "#937860",
-    "rt-base": "#da8bc3", "cuvs": "#8c8c8c", "rt-mp": "#000000",
+    "rt-base": "#da8bc3", "cuvs": "#8c8c8c",
+    "rt-mp-k1": "#555555", "rt-mp-k5": "#000000",
 }
 
 # rt-mp rows come from eval/rt_baseline_mp.py -- the arXiv:2407.12208 authors'
@@ -37,8 +38,12 @@ COLORS = {
 # from them measures something different from every other row and must not
 # share an axis with them.  It appears in the absolute-time plots instead,
 # where no reference is implied.
-WITHIN_PKG_REF = {"rt-mp"}
-RATIO_CONDS = [c for c in CONDS if c not in WITHIN_PKG_REF]
+# every rt-mp-k* row, whatever kappa
+def _within_pkg(c):
+    return c.startswith("rt-mp")
+
+WITHIN_PKG_REF = {c for c in CONDS if _within_pkg(c)}
+RATIO_CONDS = [c for c in CONDS if not _within_pkg(c)]
 NUM = {"n", "d", "k", "std", "box", "seed", "zscore", "iters", "eps",
        "hp_baseline", "hp_reference", "hp_update", "hp_total",
        "pct_eliminated", "pct_reference", "pct_update", "pct_cond3",

@@ -36,7 +36,7 @@ KEEP=0
 SRC=""; SRCKIND=""; DIM=""; K=""; N=200000; STD=1.0; BOX=10.0; SEED=1
 MAXITERS=400; CONVERGE=0; TOL=1e-8; ZSCORE=0; SUBSAMPLE=0
 # per side
-KAPPA=5.0; KERNEL=fp16_fp32; BENCH_EXTRA=""; RT_EXTRA=""
+KAPPAS="1 5"; KERNEL=fp16_fp32; BENCH_EXTRA=""; RT_EXTRA=""
 
 usage() {
     cat <<USAGE
@@ -62,7 +62,8 @@ common to both implementations:
   --subsample N      cluster N rows drawn without replacement
 
 one side only:
-  --kappa F          driver: the paper's rho       (default $KAPPA)
+  --kappa "…"        driver: space-separated rho values, one fit each
+                     (default "$KAPPAS")
   --kernel K         driver: mp-kmeans kernel      (default $KERNEL)
   --bench-extra "…"  passed verbatim to mpkmeans_bench (--accum, --only, …)
   --rt-extra "…"     passed verbatim to the driver
@@ -93,7 +94,7 @@ while [[ $# -gt 0 ]]; do
         --tol) TOL="$2"; shift 2 ;;
         --zscore) ZSCORE=1; shift ;;
         --subsample) SUBSAMPLE="$2"; shift 2 ;;
-        --kappa) KAPPA="$2"; shift 2 ;;
+        --kappa) KAPPAS="$2"; shift 2 ;;
         --kernel) KERNEL="$2"; shift 2 ;;
         --bench-extra) BENCH_EXTRA="$2"; shift 2 ;;
         --rt-extra) RT_EXTRA="$2"; shift 2 ;;
@@ -122,6 +123,7 @@ common_rt=(-k "$K" -e "$SEED" --maxiters "$MAXITERS" --tol "$TOL")
 common_bench=(-k "$K" -e "$SEED" --maxiters "$MAXITERS" --tol "$TOL")
 [[ $CONVERGE -eq 1 ]] && { common_rt+=(--convergence); common_bench+=(--convergence); }
 [[ $ZSCORE   -eq 1 ]] && { common_rt+=(--zscore);      common_bench+=(--zscore); }
+common_rt_nosub=("${common_rt[@]}")
 [[ "$SUBSAMPLE" != 0 ]] && common_rt+=(--subsample "$SUBSAMPLE")
 
 case "$SRCKIND" in
@@ -133,17 +135,32 @@ esac
 echo "=============================================================="
 echo " 1/2  mp-kmeans (arXiv:2407.12208, authors' package)"
 echo "=============================================================="
-# shellcheck disable=SC2086
-$SRUN "$PYTHON" "$RT_PY" "${src_rt[@]}" "${common_rt[@]}" \
-    --kappa "$KAPPA" --kernel "$KERNEL" \
-    --dump-data "$DATA" --dump-centroids "$C0" \
-    --csv "$OUT/rt.csv" $RT_EXTRA
+rm -f "$OUT/rt.csv"
+# The FIRST kappa materialises the data and the centroids; every later one is
+# pointed at those files, so all of them -- and the benchmark below -- cluster
+# the same numbers from the same start.
+first=1
+for kap in $KAPPAS; do
+    echo "--- kappa = $kap ---"
+    if [[ $first -eq 1 ]]; then
+        # shellcheck disable=SC2086
+        $SRUN "$PYTHON" "$RT_PY" "${src_rt[@]}" "${common_rt[@]}" \
+            --kernel "$KERNEL" --kappa "$kap" \
+            --dump-data "$DATA" --dump-centroids "$C0" \
+            --csv "$OUT/rt.csv" $RT_EXTRA
+        first=0
+        [[ -s "$DATA" && -s "$DATA.meta" ]] || {
+            echo "the driver did not write $DATA" >&2; exit 1; }
+        read -r SHARED_N SHARED_D < "$DATA.meta"
+    else
+        # --bin/--centroids, and no --subsample: the rows were chosen above
+        # shellcheck disable=SC2086
+        $SRUN "$PYTHON" "$RT_PY" --bin "$DATA" -d "$SHARED_D" \
+            "${common_rt_nosub[@]}" --kernel "$KERNEL" --kappa "$kap" \
+            --centroids "$C0" --csv "$OUT/rt.csv" $RT_EXTRA
+    fi
+done
 
-[[ -s "$DATA" && -s "$DATA.meta" ]] || {
-    echo "the driver did not write $DATA -- cannot match the benchmark to it" >&2
-    exit 1
-}
-read -r SHARED_N SHARED_D < "$DATA.meta"
 
 echo
 echo "=============================================================="
@@ -186,7 +203,7 @@ awk -F, -v rt="$OUT/rt.csv" '
             n = split(line, f, ",")
             if (f[10] == "cond" || f[10] == "") continue
             printf "  %-18s %6d %10s %10.3f %10.2f %16s\n",
-                   "rt-mp " f[9], f[11],
+                   f[10] " " f[9], f[11],
                    (f[29]+0 > 0 ? sprintf("%.3f", f[29]/(f[11]?f[11]:1)) : "-"),
                    f[37]/(f[11]?f[11]:1), f[37], f[26]
         }

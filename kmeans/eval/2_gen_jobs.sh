@@ -278,7 +278,12 @@ add_run() {
     rt_extra="${rt_extra//--accum fp16/}"
     rt_extra="${rt_extra//--skip rt/}"
     [[ "$family" == synth ]] && rt_extra="--blobs $rt_extra"
-    CUR_RT+=("run_rt -k $k $rt_extra")
+    # kappa 1 and 5: 5 is the paper's value and the measured knee at d=200,
+    # and the knee falls to ~1 by d=768, so one value would characterise only
+    # part of the d range the sweep covers.
+    for kap in $RT_KAPPAS; do
+        CUR_RT+=("run_rt -k $k --kappa $kap $rt_extra")
+    done
 }
 
 # The arXiv:2407.12208 baseline comes from its authors' own package via
@@ -287,6 +292,7 @@ add_run() {
 COMMON="--maxiters 400 --convergence -e $SEED"
 RT_PY="${RT_PY:-$HERE/rt_baseline_mp.py}"
 RT_PYTHON="${RT_PYTHON:-/pscratch/sd/j/jbellav/envs/mpk/bin/python}"
+RT_KAPPAS="${RT_KAPPAS:-1 5}"
 
 # ------------------------------------------------------------ synthetic ---
 if [[ -z "$ONLY_FAMILY" || "$ONLY_FAMILY" == synth ]]; then

@@ -71,6 +71,13 @@ import argparse, csv, os, sys, time
 
 import numpy as np
 
+# The paper's safety factor rho.  5 is the value it prescribes and the measured
+# knee at d = 200 -- the smallest value driving the kernel's argmin errors to
+# zero.  The knee falls as d rises, roughly as 1/(d*u_l), reaching ~1 by d=768,
+# which is why the evaluation runs both 1 and 5 rather than one of them.  See
+# eval/README.md; kappa_kernel.py re-derives it.
+KAPPA_DEFAULT = 5.0
+
 CSV_COLUMNS = [
     "dataset", "n", "d", "k", "std", "box", "seed", "zscore", "accum", "cond",
     "iters", "eps", "hp_baseline", "hp_reference", "hp_update", "hp_total",
@@ -277,8 +284,11 @@ def main():
                          "moving at all and whose further iterations would be "
                          "no-ops anyway.)")
     ap.add_argument("--tol", type=float, default=1e-8)
-    ap.add_argument("--kappa", type=float, default=5.0,
-                    help="their safety factor, the paper's rho (default 5)")
+    ap.add_argument("--kappa", type=float, default=KAPPA_DEFAULT,
+                    help=f"the paper's safety factor rho (default "
+                         f"{KAPPA_DEFAULT:g}).  The evaluation runs 1 and 5: "
+                         f"5 is the paper's value and the knee at d=200, and "
+                         f"the knee falls to ~1 by d=768.")
     ap.add_argument("--kernel", default="fp16_fp32")
     ap.add_argument("--zscore", action="store_true")
     ap.add_argument("--subsample", type=int, default=0)
@@ -374,7 +384,7 @@ def main():
 
     print(f"problem  : n={n} d={d} k={args.k}  {name}"
           f"{'  (z-scored)' if args.zscore else ''}")
-    print(f"kernel   : {args.kernel}  kappa={args.kappa}  init=random  "
+    print(f"kernel   : {args.kernel}  kappa={args.kappa:g}  init=random  "
           f"normalize=None")
     if args.convergence:
         print(f"stopping : ||C - C_prev||_F < {args.tol:g}, or {args.maxiters} "
@@ -462,7 +472,7 @@ def main():
         row.update(
             dataset=name, n=n, d=d, k=args.k, std=args.std, box=args.box,
             seed=args.seed, zscore=int(args.zscore), accum=args.kernel,
-            cond="rt-mp", iters=model.n_iter_, eps=0,
+            cond=f"rt-mp-k{args.kappa:g}", iters=model.n_iter_, eps=0,
             # their kernel does the test and the fallback inside one call and
             # reports neither, so this is "not measured", not "none eliminated"
             hp_baseline=int(pairs), hp_reference=0, hp_update=int(pairs),

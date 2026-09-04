@@ -110,75 +110,61 @@ worse than total fallback.)
 This is the same shape of result as our own reimplementation of the method: it
 falls back on ~97% of entries, so it is nearly exact and pays accordingly.
 
-### What kappa buys
+### kappa: the evaluation runs 1 and 5
 
-kappa is the paper's safety factor rho: the reliability test accepts the
-expanded FP16 distance when it exceeds `kappa * E_l`, and otherwise recomputes
-that entry with the direct formula in FP32. Scoring the kernel alone against an
-FP64 ground truth on converged centroids -- clustering dynamics removed, so only
-kernel accuracy is left:
+kappa is the paper's safety factor rho. `--kappa` selects it, the driver
+defaults to the paper's 5, and the generated jobs run **both 1 and 5** for every
+point (`RT_KAPPAS` overrides). Rows carry it in `cond`, as `rt-mp-k1` and
+`rt-mp-k5`, so both land in one CSV without colliding.
 
-**yandex, n=150k d=200 k=64**
+Two values rather than one because the useful value moves with d. Scored
+against an FP64 ground truth with the centroids frozen -- clustering dynamics
+removed, so only kernel accuracy is left -- the kernel's error is monotone in
+kappa and the knee falls roughly as `1/(d*u_l)`, since the error floor carries
+`gamma_l(d+2)`:
 
-| kappa | max rel err | mean rel err | argmin wrong | ms |
-| --- | --- | --- | --- | --- |
-| 0 | 5.60e-03 | 7.75e-05 | 70 (0.047%) | 0.48 |
-| 1 | 2.25e-03 | 7.68e-05 | 67 | 0.49 |
-| 2 | 7.66e-04 | 7.50e-05 | 64 | 0.49 |
-| 3 | 5.21e-04 | 6.95e-05 | 39 | 0.85 |
-| **5** | 1.78e-04 | **6.88e-07** | **0** | **4.66** |
-| 10+ | 1.17e-06 | 1.64e-07 | 0 | 3.7 |
-| *their fp32* | *9.58e-06* | *1.57e-07* | *0* | *0.51* |
+| dataset | d | knee | cost at the knee |
+| --- | --- | --- | --- |
+| yandex | 200 | 5 | 0.48 -> 4.66 ms (9.7x) |
+| arxiv | 768 | 1 | 2.48 -> 76.8 ms (31x) |
+| wiki | 3072 | 0.5 | 4.46 -> 78.2 ms (17.5x) |
 
-Monotone, and the paper's kappa = 5 is exactly the knee: the smallest value that
-drives argmin errors to zero and the mean error down two orders of magnitude.
-It costs 9x on the distance step to get there.
+At d=200, kappa=5 is exactly the knee: max relative error 5.6e-03 -> 1.2e-06 and
+argmin errors reaching zero. By d=768 that has already happened at kappa=1, so a
+single value would characterise only part of the range the sweep covers. Past
+**d = 2046** the model degenerates outright (`(d+2)*u_l >= 1`) and no kappa can
+accept anything -- the method then computes the FP16 GEMM *and* the full FP32
+direct formula, 78 ms against 4.8 ms for the package's own fp32 kernel.
 
-**The knee moves with d, and fast.** The error floor carries gamma_l(d+2) with
-u_l = 2^-11, so the threshold grows with the dimension and the kappa at which
-everything falls back scales roughly as 1/(d*u_l):
+End to end the difference is small: on overlapping blobs (b=0) the inertia error
+against fp32 is ~7e-06 and flat across kappa; at b=2 it improves from 1.5e-06 to
+7e-08. `kappa_kernel.py`, `kappa_sweep.py` and `kappa_confound.py` re-derive all
+of this.
 
-| dataset | d | predicted knee | observed | cost at the knee |
-| --- | --- | --- | --- | --- |
-| yandex | 200 | ~4.6 | 5 | 0.48 -> 4.66 ms (9.7x) |
-| arxiv | 768 | ~0.8 | 1 | 2.48 -> 76.8 ms (31x) |
-| wiki | 3072 | ~0.3 | 0.5 | 4.46 -> 78.2 ms (17.5x) |
+### Inertia is not a usable metric on well-separated blobs
 
-Past d = 2046, `(d+2)*u_l >= 1` and the model degenerates outright -- the same
-limit that made our own C++ rt-base decline those problems. At wiki's d = 3072
-the test can never accept anything, so at every kappa the method computes the
-FP16 GEMM *and* the full FP32 direct formula, for 78 ms against 4.8 ms for
-their plain fp32 kernel. The mixed-precision path is pure overhead there.
+Worth knowing before reading any b=10 result. Measuring fp32's *own* final
+inertia across six random-point initialisations, same data:
 
-One genuine win: at full fallback the kernel is **more accurate than their own
-fp32 kernel** (arxiv: 2.4e-06 vs 2.6e-05 max error, and their fp32 gets one
-argmin wrong where the fallback gets none). The fallback uses the direct
-formula, which does not cancel; `pairwise_euclidean_single` uses the expanded
-one, which does.
-
-**But the clustering barely notices, and a single-seed sweep cannot even see
-it.** Over full 20-iteration fits from one shared set of centroids the trend is
-real but tiny: inertia falls slightly from kappa 0 to 3 and, from kappa 5 on,
-matches the fp32 run to ten digits -- which is what the kernel table predicts,
-since argmin errors reach zero at 5. The trouble is the size of it:
-
-| | spread in final inertia |
+| separation | fp32 spread across starts |
 | --- | --- |
-| vary kappa 0 -> 1e6, same starting centroids | 7.5e-05 |
-| fix kappa = 5, vary starting centroids (8 seeds) | **3.6e-03** |
+| b=10 | **67%** |
+| b=2 | 4.6% |
+| b=0 | 1.5e-04 |
 
-Choosing a different 64 starting points moves the answer **48x more** than
-sweeping kappa over its whole range, so one seed reads a quantity far below its
-own noise floor -- which is why the first sweep here showed sign flips and no
-order. To measure kappa end to end, average over ~20 initialisations; to
-measure the kernel, do not cluster at all (`kappa_kernel.py`).
+At b=10, random-point init on 32 well-separated blobs routinely puts two
+centroids in one true cluster and none in another, so runs converge to
+structurally different solutions tens of percent apart, and a 1e-6 arithmetic
+perturbation is enough to flip which one. Pairing on the initial centroids does
+not rescue it, because the perturbation changes the discrete outcome. So
+inertia there is a lottery whose variance is five orders of magnitude larger
+than any precision effect.
 
-The substantive point survives either way. At kappa = 0 only 0.047% of points
-get the wrong nearest centroid per iteration and Lloyd's absorbs that; label
-disagreement against fp32 falls only from 0.51% to 0.33% across the entire
-kappa range. The reliability test does exactly what it claims at the kernel
-level, and the outer loop is robust enough that you are paying 9x to 31x for
-accuracy the clustering mostly does not need.
+This is a latent fragility in the benchmark's `rel_inertia < 1e-4` correctness
+gate, which the eval applies at b=10 among others. Our own schemes pass it
+comfortably (~2e-07 at b=10) because they perturb far less than an FP16 path
+does, so it is not biting today -- but a failure there would not mean what it
+appears to.
 
 ### run_one.sh — one problem, both implementations, identical inputs
 
