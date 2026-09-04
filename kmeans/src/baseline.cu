@@ -320,7 +320,11 @@ extern "C" mpkStatus mpkMeansBaselineRT(cublasHandle_t blas, const float* dP,
                 bestpack, n, dAssign);
             t5.stop(s, &stats->t_assign_ms);
 
-            stats->tested      += (long long)n * (k - 1);
+            /* n*k, not n*(k-1): that exemption belongs to the exclusion
+             * scheme, where each row's incumbent is never tested against
+             * itself.  This baseline has no incumbent -- k_rt_scan applies the
+             * reliability test to every entry of every row. */
+            stats->tested      += (long long)n * k;
             stats->hp_baseline += (long long)n * k;
             stats->hp_update   += nnz;
 

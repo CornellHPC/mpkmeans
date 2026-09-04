@@ -135,9 +135,14 @@ typedef struct {
                                * dense, the undecided count when it went narrow.
                                * / (iters*n) is the effective refine width      */
 
-    /* --- attribution of the exclusions, over the n*(k-1) tested pairs ------
+    /* --- attribution of the exclusions, over the tested pairs --------------
      * Only filled when the library was built with MPK_STATS.                 */
-    long long tested;         /* n*(k-1) per iteration                         */
+    long long tested;         /* pairs the scheme's test was applied to, per
+                               * iteration.  n*(k-1) for the exclusion schemes,
+                               * whose incumbent is exempt from being tested
+                               * against itself; n*k for mpkMeansBaselineRT,
+                               * whose per-entry reliability test has no
+                               * incumbent and no exemption.                   */
     long long excl_cond3;     /* condition (3) held                            */
     long long excl_cond6;     /* condition (6) held                            */
     long long excl_both;      /* both held                                     */

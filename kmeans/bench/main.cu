@@ -479,9 +479,12 @@ int main(int argc, char** argv) {
     const int sref_idx = only >= 0 ? only : 0;
 
     if (smix[sref_idx].stats_built) {
-        printf("\nexclusion attribution, over the n*(k-1) tested pairs\n");
+        printf("\nexclusion attribution, over the pairs each scheme tested\n");
         printf("  for (3)->(6), (6) is only ever evaluated on the rows (3) did\n"
                "  not clear, so its share is over that subset, not over all n\n");
+        printf("  the denominator is n*(k-1) for the exclusion schemes, whose\n"
+               "  incumbent is exempt, and n*k for rt-base, which tests every\n"
+               "  entry; rt-base excludes nothing, so its row is 0 either way\n");
         printf("  %-8s %10s %10s %10s %10s %10s\n",
                "cond", "(3) held", "(6) held", "both", "(3) only", "(6) only");
         for (int c = 0; c < MPK_NCFG; ++c) {
