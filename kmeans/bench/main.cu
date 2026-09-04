@@ -53,10 +53,18 @@ static void usage(const char* p) {
            "  --accum <a>    low precision GEMM accumulator: fp32 or fp16\n"
            "                 (default fp32; mpkMeansMixed configs only --\n"
            "                  rt-base and fp32 are unaffected)\n"
+           "  --gather-frac <f>  multiword only: refine narrowly while at most\n"
+           "                 this fraction of rows is undecided, else densely\n"
+           "                 (default 0.35)\n"
+           "  --macs <int>   multiword only: how many of the three fp16 cross\n"
+           "                 products the refinement cascade may reach, 1..3\n"
+           "                 (default 3 = double-fp16; a stage is only issued\n"
+           "                  if the previous exclusion test left survivors)\n"
            "  --only <c>     run one config only: 3, 6, 36, c (cascade),\n"
            "                 rt (arXiv:2407.12208 baseline), raw (no exclusion\n"
            "                 test, no FP32 refinement -- the low precision\n"
-           "                 argmin trusted outright, no correctness guarantee)\n"
+           "                 argmin trusted outright, no correctness guarantee),\n"
+           "                 mw (multiword double-fp16)\n"
            "  --no-verify    skip the per-iteration FP64 oracle check\n"
            "                 (the oracle needs a -DMPK_STATS=ON build; it is\n"
            "                  on by default there and absent otherwise)\n"
@@ -98,7 +106,8 @@ static double label_agreement(const std::vector<int>& a, const std::vector<int>&
 
 struct Config {
     const char* name;
-    int cond3, cond6, cascade, baseline;
+    int cond3, cond6, cascade;
+    int driver;   /* 0 mpkMeansMixed, 1 mpkMeansBaselineRT, 2 mpkMeansMultiword */
 };
 
 /* (3)->(6) is the cascade: the same exclusions as (3)+(6), but the reference
@@ -112,7 +121,13 @@ struct Config {
  * with no exclusion test and no FP32 recomputation at all.  It has no
  * correctness guarantee -- it is the naive scheme Theorem 1 exists to make
  * safe -- and is here so that guarantee has something to be measured against. */
-#define MPK_NCFG 6
+/* mw is the multiword (double-fp16) scheme: the same conditions (3)+(6), but
+ * over a distance matrix assembled one fp16 cross product at a time, with the
+ * test re-run between products to decide whether the next one is needed.  Its
+ * refinement is another tensor-core GEMM rather than a warp-per-entry FP32
+ * dot, so the number to watch for it is cross products per iteration, not
+ * entries refined. */
+#define MPK_NCFG 7
 static const Config kConfigs[MPK_NCFG] = {
     {"(3)",     1, 0, 0, 0},
     {"(6)",     0, 1, 0, 0},
@@ -120,6 +135,7 @@ static const Config kConfigs[MPK_NCFG] = {
     {"(3)->(6)",1, 1, 1, 0},
     {"rt-base", 0, 0, 0, 1},
     {"raw",     0, 0, 0, 0},
+    {"mw",      1, 1, 0, 2},
 };
 
 int main(int argc, char** argv) {
@@ -131,6 +147,8 @@ int main(int argc, char** argv) {
     float tol = 1e-8f;
     float rt_theta = 0.f;      /* 0 -> the paper's 5 */
     int   accum = MPK_ACCUM_FP32;
+    int   mw_macs = 3;          /* multiword: ceiling on the cross products */
+    float mw_gather_frac = 0.f;     /* multiword: 0 = derive from k */
 
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
@@ -149,6 +167,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "--convergence")) converge = 1;
         else if (!strcmp(a, "--tol")) tol = (float)atof(next());
         else if (!strcmp(a, "--theta")) rt_theta = (float)atof(next());
+        else if (!strcmp(a, "--macs")) mw_macs = atoi(next());
+        else if (!strcmp(a, "--gather-frac")) mw_gather_frac = (float)atof(next());
         else if (!strcmp(a, "--accum")) {
             const char* v = next();
             if      (!strcmp(v, "fp32")) accum = MPK_ACCUM_FP32;
@@ -162,7 +182,8 @@ int main(int argc, char** argv) {
             const char* v = next();
             only = !strcmp(v, "3") ? 0 : !strcmp(v, "6") ? 1 :
                    !strcmp(v, "36") ? 2 : !strcmp(v, "c") ? 3 :
-                   !strcmp(v, "rt") ? 4 : !strcmp(v, "raw") ? 5 : -1;
+                   !strcmp(v, "rt") ? 4 : !strcmp(v, "raw") ? 5 :
+                   !strcmp(v, "mw") ? 6 : -1;
             if (only < 0) { usage(argv[0]); return 1; }
         }
         else if (!strcmp(a, "-v")) verbose = 1;
@@ -267,6 +288,8 @@ int main(int argc, char** argv) {
     par.tol           = converge ? tol : 0.f;
     par.rt_theta      = rt_theta;
     par.accum         = accum;
+    par.mw_macs       = mw_macs;
+    par.mw_gather_frac= mw_gather_frac;
     par.verbose       = verbose;
 
     mpkStats smix[MPK_NCFG], sref;
@@ -283,6 +306,9 @@ int main(int argc, char** argv) {
         CHK(cudaMemcpy(dCmix, dC0, (size_t)k * d * sizeof(float),
                        cudaMemcpyDeviceToDevice));
         mpkMeansBaselineRT(blas, dPraw, n, d, k, dCmix, dAmix, &w, &junk);
+        CHK(cudaMemcpy(dCmix, dC0, (size_t)k * d * sizeof(float),
+                       cudaMemcpyDeviceToDevice));
+        mpkMeansMultiword(blas, dP, n, d, k, dCmix, dAmix, &w, &junk);
         CHK(cudaMemcpy(dCref, dC0, (size_t)k * d * sizeof(float),
                        cudaMemcpyDeviceToDevice));
         mpkMeansFP32(blas, dP, n, d, k, dCref, dAref, &w, &junk);
@@ -311,15 +337,21 @@ int main(int argc, char** argv) {
             CHK(cudaMemcpy(dCmix, dC0, (size_t)k * d * sizeof(float),
                            cudaMemcpyDeviceToDevice));
             par.verify = (r == repeats - 1) ? verify : 0;
-            /* dC0 was picked from the shifted P; undo it for the baseline so
-             * both start from the same points in their own frame */
-            if (kConfigs[c].baseline)
+            /* dC0 was picked from the shifted P; undo it for rt-base so both
+             * start from the same points in their own frame.  The multiword
+             * driver stays in the shifted frame: its bound, like (3)/(6)'s,
+             * is componentwise against |A||B| and needs non-negative P. */
+            if (kConfigs[c].driver == 1)
                 mpkShiftCentroids(dCmix, k, d, -shift);
-            const mpkStatus rc = kConfigs[c].baseline
-                ? mpkMeansBaselineRT(blas, dPraw, n, d, k, dCmix, dAmix, &par,
-                                     &smix[c])
-                : mpkMeansMixed(blas, dP, n, d, k, dCmix, dAmix, &par,
-                                &smix[c]);
+            const mpkStatus rc =
+                kConfigs[c].driver == 1
+                    ? mpkMeansBaselineRT(blas, dPraw, n, d, k, dCmix, dAmix,
+                                         &par, &smix[c])
+              : kConfigs[c].driver == 2
+                    ? mpkMeansMultiword(blas, dP, n, d, k, dCmix, dAmix, &par,
+                                        &smix[c])
+                    : mpkMeansMixed(blas, dP, n, d, k, dCmix, dAmix, &par,
+                                    &smix[c]);
             if (rc != MPK_OK) {
                 fprintf(stderr, "mixed %s failed\n", kConfigs[c].name);
                 return 1;
@@ -489,6 +521,40 @@ int main(int argc, char** argv) {
         printf("  %-8s %14.1f %12.4f %12.2f\n", kConfigs[c].name,
                (double)S.hp_update / it, S.t_hp_update_ms / it,
                S.hp_update ? S.t_hp_update_ms * 1e6 / (double)S.hp_update : 0.0);
+    }
+
+    /* The multiword scheme does not refine entries at all -- it refines the
+     * whole matrix, one fp16 cross product at a time, and the exclusion test
+     * decides whether the next product is issued.  So its cost is a product
+     * count, and the row above (a gather out of an already-refined G) says
+     * nothing about it. */
+    {
+        int any_mw = 0;
+        for (int c = 0; c < MPK_NCFG; ++c)
+            if ((only < 0 || only == c) && kConfigs[c].driver == 2) any_mw = 1;
+        if (any_mw) {
+            printf("\n  multiword cost -- cross products, not entries\n");
+            printf("  %-8s %16s %14s %14s %14s\n", "cond", "products/iter",
+                   "ms gemm/iter", "eps at cut", "refine width");
+            for (int c = 0; c < MPK_NCFG; ++c) {
+                if (only >= 0 && only != c) continue;
+                if (kConfigs[c].driver != 2) continue;
+                const mpkStats& S = smix[c];
+                const double it = fmax(S.iters, 1);
+                const double per = (double)S.mw_products / it;
+                /* the bound actually reached, at the average product count */
+                const int cut = (int)(per + 0.5) < 1 ? 1
+                              : ((int)(per + 0.5) > 3 ? 3 : (int)(per + 0.5));
+                printf("  %-8s %16.2f %14.4f %14.3e %13.1f%%\n",
+                       kConfigs[c].name, per, S.t_gemm_lo_ms / it,
+                       mpkMultiwordEpsilon(d, cut),
+                       100.0 * (double)S.mw_refine_rows / (it * (double)n));
+            }
+            printf("  1.00 means the bound settled every row from the leading\n"
+                   "  product alone; 3.00 means it always needed full\n"
+                   "  double-fp16.  eps is mpkMultiwordEpsilon at that cut --\n"
+                   "  the accuracy the answer actually carries.\n");
+        }
     }
 
     /* ---------------------------------------------------- verification --- */

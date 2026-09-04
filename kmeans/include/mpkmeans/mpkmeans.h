@@ -77,6 +77,22 @@ typedef struct {
                            * Ignored unless both conditions are on.  default 0 */
     int   accum;          /* mpkAccum, mpkMeansMixed only.  default
                            * MPK_ACCUM_FP32                                    */
+    int   mw_macs;        /* multiword only (mpkMeansMultiword): how many of
+                           * the three cross products the refinement cascade
+                           * may reach.  1 never refines (plain fp16), 3 is the
+                           * paper's double-fp16 cut.  A stage is only paid for
+                           * if the previous exclusion test left something
+                           * unsettled, so this is a ceiling, not a count.
+                           * default 3                                         */
+    float mw_gather_frac; /* multiword only: refine narrowly -- gather the rows
+                           * that still hold a survivor and run the remaining
+                           * cross products only that wide -- while at most
+                           * this fraction of the rows is undecided.  Above it,
+                           * refine the whole matrix densely instead, since the
+                           * gather stops paying for itself.  <= 0 (the default)
+                           * picks the crossover from k, which is what it
+                           * actually tracks: measured ~0.20 at k=32, ~0.33 at
+                           * k=128, ~0.70 at k=256                              */
     float rt_theta;       /* baseline only (mpkMeansBaselineRT): the safety
                            * factor of arXiv:2407.12208 (4.13).  Must be > 2;
                            * they use 5 throughout, which is the default when
@@ -101,7 +117,23 @@ typedef struct {
     long long hp_baseline;    /* n*k per iteration                             */
     long long hp_reference;   /* reference entries actually evaluated: n per
                                * iteration for (6), fewer under the cascade    */
-    long long hp_update;      /* survivors refined in FP32                     */
+    long long hp_update;      /* survivors refined in FP32.  For the multiword
+                               * driver the refinement is a dense GEMM, so this
+                               * counts n*k for every iteration that needed a
+                               * second cross product -- the honest number of
+                               * entries recomputed, not the survivor count    */
+
+    /* --- multiword only (mpkMeansMultiword) -------------------------------
+     * The headline cost here is cross products issued, not entries evaluated:
+     * every stage is a whole tensor-core GEMM, and the exclusion test decides
+     * whether the next one is needed at all.  mw_products / iters is the
+     * number to compare -- 1.0 means the bound settled every row at plain
+     * fp16 cost, 3.0 means it always needed full double-fp16. */
+    long long mw_products;    /* cross products issued, summed over the run    */
+    long long mw_refine_rows; /* rows the refining products were actually run
+                               * over: n per iteration when the refinement went
+                               * dense, the undecided count when it went narrow.
+                               * / (iters*n) is the effective refine width      */
 
     /* --- attribution of the exclusions, over the n*(k-1) tested pairs ------
      * Only filled when the library was built with MPK_STATS.                 */
@@ -179,6 +211,48 @@ mpkStatus mpkMeansFP32(cublasHandle_t blas,
                        const float* dP, int n, int d, int k,
                        float* dC, int* dAssign,
                        const mpkParams* params, mpkStats* stats);
+
+/* Multiword (double-fp16) Lloyd's, implemented in src/multiword.cu.
+ *
+ * The same conditions (3)/(6) as mpkMeansMixed, over a distance matrix built
+ * one fp16 cross product at a time:
+ *
+ *     stage 1:  G  = C_1^T P_1
+ *     stage 2:  G += C_1^T P_2
+ *     stage 3:  G += C_2^T P_1     (double-fp16, the paper's p=2 cut)
+ *
+ * Each stage is one tensor-core GEMM over the whole matrix; the exclusion test
+ * runs again after each, and a stage is only issued if the previous test left
+ * something unsettled.  So the refinement is another GEMM rather than a
+ * warp-per-entry FP32 dot, and the test's job is "do I need the next cross
+ * product" rather than "which entries do I recompute".
+ *
+ * dP must be shifted non-negative, as for mpkMeansMixed -- the bound below is
+ * componentwise against |A||B|, which is AB only for non-negative operands.
+ * P is split once for the whole run; only C is re-split, per iteration.
+ * Requires a build with -DMPK_MULTIWORD=ON; returns MPK_ERR_INVALID otherwise.
+ *
+ * References
+ *   M. Fasi, N. J. Higham, F. Lopez, T. Mary, M. Mikaitis, "Matrix
+ *   Multiplication in Multiword Arithmetic: Error Analysis and Application to
+ *   GPU Tensor Cores", MIMS EPrint 2022.3 (GAMM 2022). */
+mpkStatus mpkMeansMultiword(cublasHandle_t blas,
+                            const float* dP, int n, int d, int k,
+                            float* dC, int* dAssign,
+                            const mpkParams* params, mpkStats* stats);
+
+/* Relative error bound of the multiword product after `macs` of the three
+ * cross products, for inner dimension d -- the per-stage analogue of
+ * mpkEpsilon, and what mpkMeansMultiword's exclusion test uses at each stage.
+ * From the bounds of the GAMM 2022 presentation (slides 7-9):
+ *
+ *     |E| <= ( (p+1) u_lo^p + gamma^hi_{n+p^2-1} ) |A||B|
+ *
+ * evaluated at the cut each stage sits on: macs=1 is the p=1 case (and equals
+ * mpkEpsilon(d, MPK_ACCUM_FP32)), macs=3 is the p=2 double-fp16 bound, and
+ * macs=2 sits between them, still O(u_lo) because one cross product of the
+ * pair is still missing.  Negative if the model degenerates. */
+double mpkMultiwordEpsilon(int d, int macs);
 
 /* ---------------------------------------------------------------- data --- */
 
