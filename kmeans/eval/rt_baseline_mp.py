@@ -203,9 +203,13 @@ def main():
     ap.add_argument("--dump-centroids",
                     help="write the initial centroids, for mpkmeans_bench "
                          "--init-centroids")
-    ap.add_argument("--reference", choices=["fp32", "none"], default="fp32",
+    ap.add_argument("--reference", choices=["fp32", "none"], default="none",
                     help="also fit with their uniform-fp32 kernel from the same "
-                         "centroids, to fill the *_fp32 columns (default fp32)")
+                         "centroids, filling the *_fp32 columns.  Off by "
+                         "default: those columns would then hold THIS package's "
+                         "fp32, not mpkMeansFP32, which is a different "
+                         "reference from every other row's and doubles the "
+                         "runtime for a number the plots do not use.")
     ap.add_argument("--csv", help="append a row here (header written if new)")
     ap.add_argument("--csv-header", action="store_true",
                     help="print the CSV header and exit")

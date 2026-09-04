@@ -282,9 +282,9 @@ add_run() {
 }
 
 # The arXiv:2407.12208 baseline comes from its authors' own package via
-# eval/rt_baseline_mp.py, not from our reimplementation of it, so the C++
-# rt-base config is skipped in every bench invocation.
-COMMON="--maxiters 400 --convergence -e $SEED --skip rt"
+# eval/rt_baseline_mp.py.  Our reimplementation of it is no longer a config in
+# mpkmeans_bench at all, so there is nothing to skip.
+COMMON="--maxiters 400 --convergence -e $SEED"
 RT_PY="${RT_PY:-$HERE/rt_baseline_mp.py}"
 RT_PYTHON="${RT_PYTHON:-/pscratch/sd/j/jbellav/envs/mpk/bin/python}"
 

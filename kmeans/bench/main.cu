@@ -73,13 +73,9 @@ static void usage(const char* p) {
            "                 arXiv:2407.12208 package and cuVS use -- or at\n"
            "                 --maxiters, whichever comes first\n"
            "  --tol <float>  the tolerance above         (default 1e-8)\n"
-           "  --theta <f>    rt-base safety factor of (4.13), must be > 2\n"
-           "                 (default 2.5; the paper names this constant two\n"
-           "                  inconsistent ways -- see the file comment at the\n"
-           "                  top of src/baseline.cu for which was picked)\n"
            "  --accum <a>    low precision GEMM accumulator: fp32 or fp16\n"
-           "                 (default fp32; mpkMeansMixed configs only --\n"
-           "                  rt-base and fp32 are unaffected)\n"
+           "                 (default fp32; the mixed and mw configs only --\n"
+           "                  fp32 and cuvs are FP32 throughout)\n"
            "  --gather-frac <f>  multiword only: refine narrowly while at most\n"
            "                 this fraction of rows is undecided, else densely\n"
            "                 (default 0.35)\n"
@@ -91,15 +87,11 @@ static void usage(const char* p) {
            "                 means n -- one untiled pass, the shape our own\n"
            "                 schemes run in.  cuVS's own default is 32768;\n"
            "                 pass it to measure the library as it ships\n"
-           "  --skip <c>     drop one config by name; repeatable.  The eval\n"
-           "                 uses --skip rt, running the arXiv:2407.12208\n"
-           "                 baseline from its authors' own package instead\n"
-           "                 (eval/rt_baseline_mp.py)\n"
-           "  --only <c>     run one config only: 3, 6, 36, c (cascade),\n"
-           "                 rt (arXiv:2407.12208 baseline), raw (no exclusion\n"
-           "                 test, no FP32 refinement -- the low precision\n"
-           "                 argmin trusted outright, no correctness guarantee),\n"
-           "                 mw (multiword double-fp16),\n"
+           "  --skip <c>     drop one config by name; repeatable\n"
+           "  --only <c>     run one config only: 3, c (the (3)->(6) cascade),\n"
+           "                 raw (no exclusion test, no FP32 refinement -- the\n"
+           "                 low precision argmin trusted outright, no\n"
+           "                 correctness guarantee), mw (multiword double-fp16),\n"
            "                 cuvs (RAPIDS FP32 k-means, needs -DMPK_CUVS=ON)\n"
            "  --no-verify    skip the per-iteration FP64 oracle check\n"
            "                 (the oracle needs a -DMPK_STATS=ON build; it is\n"
@@ -143,16 +135,23 @@ static double label_agreement(const std::vector<int>& a, const std::vector<int>&
 struct Config {
     const char* name;
     int cond3, cond6, cascade;
-    int driver;   /* 0 mpkMeansMixed, 1 mpkMeansBaselineRT,
-                   * 2 mpkMeansMultiword, 3 mpkMeansCuvs             */
+    int driver;   /* 0 mpkMeansMixed, 2 mpkMeansMultiword,
+                   * 3 mpkMeansCuvs.  1 was mpkMeansBaselineRT, which is no
+                   * longer run here -- see the note above kConfigs.   */
 };
 
 /* (3)->(6) is the cascade: the same exclusions as (3)+(6), but the reference
  * entry -- and with it the FP32 read of P, which is what (6) costs -- is
  * evaluated only for the rows (3) did not clear outright. */
-/* rt-base is the arXiv:2407.12208 reliability-test scheme, a different
- * strategy entirely (per-entry cancellation test, not cluster exclusion), run
- * here as a baseline. */
+/* The arXiv:2407.12208 reliability-test scheme is NOT here.  It used to be the
+ * `rt-base` config, our own reimplementation of it; the evaluation now runs
+ * that paper's method from its authors' package instead
+ * (eval/rt_baseline_mp.py), so carrying a second, worse copy of it in this
+ * table only invited the two to disagree.  mpkMeansBaselineRT is still in the
+ * library and still callable -- nothing here calls it.
+ *
+ * (6) and (3)+(6) are gone for a duller reason: (3)->(6) is the cascade of the
+ * two and dominates both, so they were three rows measuring one idea. */
 /* raw asks mpkMeansMixed for cond3 = cond6 = 0, which used to be an error and
  * is now the no-refinement mode: the low precision argmin is trusted outright,
  * with no exclusion test and no FP32 recomputation at all.  It has no
@@ -169,13 +168,10 @@ struct Config {
  * against which "faster than fp32" is worth anything, since our fp32 reference
  * is our own code and could simply be slow.  Only present when the library was
  * built with -DMPK_CUVS=ON; otherwise its row is skipped. */
-#define MPK_NCFG 8
+#define MPK_NCFG 5
 static const Config kConfigs[MPK_NCFG] = {
     {"(3)",     1, 0, 0, 0},
-    {"(6)",     0, 1, 0, 0},
-    {"(3)+(6)", 1, 1, 0, 0},
     {"(3)->(6)",1, 1, 1, 0},
-    {"rt-base", 0, 0, 0, 1},
     {"raw",     0, 0, 0, 0},
     {"mw",      1, 1, 0, 2},
     {"cuvs",    0, 0, 0, 3},
@@ -188,7 +184,6 @@ int main(int argc, char** argv) {
     const char* dataset = nullptr;
     int   converge = 0;
     float tol = 1e-8f;
-    float rt_theta = 0.f;      /* 0 -> the paper's 5 */
     int   accum = MPK_ACCUM_FP32;
     int   mw_macs = 3;          /* multiword: ceiling on the cross products */
     float mw_gather_frac = 0.f;     /* multiword: 0 = derive from k */
@@ -217,10 +212,9 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "--init-centroids")) initc = next();
         else if (!strcmp(a, "--skip")) {
             const char* v = next();
-            int c = !strcmp(v, "3") ? 0 : !strcmp(v, "6") ? 1 :
-                    !strcmp(v, "36") ? 2 : !strcmp(v, "c") ? 3 :
-                    !strcmp(v, "rt") ? 4 : !strcmp(v, "raw") ? 5 :
-                    !strcmp(v, "mw") ? 6 : !strcmp(v, "cuvs") ? 7 : -1;
+            int c = !strcmp(v, "3") ? 0 : !strcmp(v, "c") ? 1 :
+                    !strcmp(v, "raw") ? 2 :
+                    !strcmp(v, "mw") ? 3 : !strcmp(v, "cuvs") ? 4 : -1;
             if (c < 0) { usage(argv[0]); return 1; }
             skipped[c] = 1;
         }
@@ -229,7 +223,6 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "--zscore")) zscore = 1;
         else if (!strcmp(a, "--cuvs-batch")) cuvs_batch = atoi(next());
         else if (!strcmp(a, "--tol")) tol = (float)atof(next());
-        else if (!strcmp(a, "--theta")) rt_theta = (float)atof(next());
         else if (!strcmp(a, "--macs")) mw_macs = atoi(next());
         else if (!strcmp(a, "--gather-frac")) mw_gather_frac = (float)atof(next());
         else if (!strcmp(a, "--accum")) {
@@ -243,10 +236,9 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "--no-verify")) verify = 0;
         else if (!strcmp(a, "--only")) {
             const char* v = next();
-            only = !strcmp(v, "3") ? 0 : !strcmp(v, "6") ? 1 :
-                   !strcmp(v, "36") ? 2 : !strcmp(v, "c") ? 3 :
-                   !strcmp(v, "rt") ? 4 : !strcmp(v, "raw") ? 5 :
-                   !strcmp(v, "mw") ? 6 : !strcmp(v, "cuvs") ? 7 : -1;
+            only = !strcmp(v, "3") ? 0 : !strcmp(v, "c") ? 1 :
+                   !strcmp(v, "raw") ? 2 :
+                   !strcmp(v, "mw") ? 3 : !strcmp(v, "cuvs") ? 4 : -1;
             if (only < 0) { usage(argv[0]); return 1; }
         }
         else if (!strcmp(a, "-v")) verbose = 1;
@@ -346,7 +338,7 @@ int main(int argc, char** argv) {
                    "iterations\n", tol, max_iter);
         else
             printf("stopping : label stability, or %d iterations\n", max_iter);
-        printf("gemm     : FP16 operands, %s accumulate (rt-base is always FP32)\n",
+        printf("gemm     : FP16 operands, %s accumulate\n",
                accum == MPK_ACCUM_FP16 ? "FP16" : "FP32");
         printf("eps      : %.6e   ->  factor 2*eps/(1-eps) = %.6e\n",
                eps, 2.0 * eps / (1.0 - eps));
@@ -405,11 +397,11 @@ int main(int argc, char** argv) {
 
     float shift = 0.f;
     if (mpkShiftNonNegative(dP, n, d, &shift) != MPK_OK) return 1;
-    if (!csv) printf("shift    : P += %.6g for (3)/(6); rt-base runs unshifted\n",
+    if (!csv) printf("shift    : P += %.6g for (3)/(6); cuvs runs unshifted\n",
                      shift);
 
     /* dC0 lives in the SHIFTED frame, because that is where it is drawn from
-     * and what mpkMeansMixed/mpkMeansMultiword expect; the rt-base and cuvs
+     * and what mpkMeansMixed/mpkMeansMultiword expect; the cuvs
      * drivers map it back with mpkShiftCentroids(-shift) below.  A file of
      * centroids is written in the unshifted frame -- that is the frame the
      * data itself is in before the shift, and the only one another
@@ -438,7 +430,6 @@ int main(int argc, char** argv) {
     mpkParams par; mpkParamsInit(&par);
     par.max_iter      = max_iter;
     par.tol           = converge ? tol : 0.f;
-    par.rt_theta      = rt_theta;
     par.accum         = accum;
     par.mw_macs       = mw_macs;
     par.mw_gather_frac= mw_gather_frac;
@@ -524,17 +515,14 @@ int main(int argc, char** argv) {
             CHK(cudaMemcpy(dCmix, dC0, (size_t)k * d * sizeof(float),
                            cudaMemcpyDeviceToDevice));
             par.verify = (r == repeats - 1) ? verify : 0;
-            /* dC0 was picked from the shifted P; undo it for rt-base so both
+            /* dC0 was picked from the shifted P; undo it for cuvs so both
              * start from the same points in their own frame.  The multiword
              * driver stays in the shifted frame: its bound, like (3)/(6)'s,
              * is componentwise against |A||B| and needs non-negative P. */
-            if (kConfigs[c].driver == 1 || kConfigs[c].driver == 3)
+            if (kConfigs[c].driver == 3)
                 mpkShiftCentroids(dCmix, k, d, -shift);
             const mpkStatus rc =
-                kConfigs[c].driver == 1
-                    ? mpkMeansBaselineRT(blas, dPraw, n, d, k, dCmix, dAmix,
-                                         &par, &smix[c])
-              : kConfigs[c].driver == 2
+                kConfigs[c].driver == 2
                     ? mpkMeansMultiword(blas, dP, n, d, k, dCmix, dAmix, &par,
                                         &smix[c])
               : kConfigs[c].driver == 3
@@ -546,9 +534,6 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "%s: declined this problem (n=%d d=%d k=%d) "
                                 "-- dropped from this run\n",
                         kConfigs[c].name, n, d, k);
-                if (kConfigs[c].driver == 1 && (double)(d + 2) * 4.8828125e-4 >= 1.0)
-                    fprintf(stderr, "  rt-base needs (d+2)*u_16 < 1, i.e. "
-                                    "d < 2046; this d is %d\n", d);
                 cfg_ran[c] = 0;
                 break;
             }
@@ -666,9 +651,8 @@ int main(int argc, char** argv) {
         printf("  for (3)->(6), (6) is only ever evaluated on the rows (3) did\n"
                "  not clear, so its share is over that subset, not over all n\n");
         printf("  the denominator is n*(k-1) for the exclusion schemes, whose\n"
-               "  incumbent is exempt, and n*k for rt-base, which tests every\n"
-               "  entry; rt-base excludes nothing, so its row is 0 either way,\n"
-               "  and cuvs runs no exclusion test at all, so neither does its\n");
+               "  incumbent is exempt; cuvs runs no exclusion test at all, so\n"
+               "  its row is 0 by construction\n");
         printf("  %-8s %10s %10s %10s %10s %10s\n",
                "cond", "(3) held", "(6) held", "both", "(3) only", "(6) only");
         for (int c = 0; c < MPK_NCFG; ++c) {
@@ -837,17 +821,16 @@ int main(int argc, char** argv) {
                "  does not hold.  label != fp32 label counts rows where the FP32\n"
                "  answer was reachable but not chosen; excess is what that cost\n"
                "  in the FP32 distances themselves.\n"
-               "  rt-base has no per-iteration hookup into this oracle at all --\n"
-               "  a different strategy entirely -- so its row always reads\n"
+               "  cuvs has no per-iteration hookup into this oracle at all --\n"
+               "  it is one opaque library call -- so its row always reads\n"
                "  0/rows: an absence of measurement, not a passing check.\n"
-               "  The same goes for cuvs, which is one opaque library call.\n"
                "  raw ran no exclusion test, so \"reachable\" is trivially every\n"
                "  row: its bound violations column is 0 by construction, for the\n"
                "  same reason, but label != fp32 label and excess are real --\n"
                "  they score how often trusting the low precision argmin outright\n"
                "  got the wrong answer, and by how much.\n"
                "  The clustering table below is the other way to see this, for\n"
-               "  every scheme including rt-base.\n");
+               "  every scheme including cuvs.\n");
     } else if (verify) {
         printf("  -- SKIPPED: this binary was built without MPK_STATS, so the\n"
                "  FP64 oracle is compiled out.  Rebuild with -DMPK_STATS=ON.\n");
