@@ -13,9 +13,9 @@ rt-base was written against.
 What is held equal to the C++ benchmark, and how:
 
   subsampling   NOT shared.  This draws with numpy's Generator and the bench
-                with std::mt19937, so the same -e picks different rows.  When
-                --subsample is in play, use --dump-subsample here and hand the
-                bench that file with --bin, or the two cluster different data.
+                with std::mt19937, so the same -e picks different rows.  Nor
+                are --blobs, which no two RNGs reproduce.  Use --dump-data and
+                hand the bench that file with --bin -- run_one.sh wires it up.
   data          --bin and --libsvm read exactly the files mpkmeans_bench reads,
                 so the matrix clustered is the same one, bit for bit.  --blobs
                 mirrors mpkMakeBlobs' construction (centers uniform in
@@ -206,13 +206,16 @@ def main():
     ap.add_argument("--kernel", default="fp16_fp32")
     ap.add_argument("--zscore", action="store_true")
     ap.add_argument("--subsample", type=int, default=0)
-    ap.add_argument("--dump-subsample",
-                    help="write the subsampled matrix here as raw float32.  "
-                         "REQUIRED for a matched comparison when --subsample "
-                         "is used: this driver draws with numpy's Generator "
-                         "and mpkmeans_bench with std::mt19937, so the same "
-                         "-e gives DIFFERENT subsets.  Point the bench at this "
-                         "file with --bin instead of letting it subsample.")
+    ap.add_argument("--dump-data", "--dump-subsample", dest="dump_data",
+                    help="write the matrix this run will cluster -- after any "
+                         "--subsample, before any --zscore -- as raw float32, "
+                         "plus a <file>.meta holding 'n d'.  Hand that file to "
+                         "mpkmeans_bench with --bin and the two cluster exactly "
+                         "the same numbers.  Needed whenever the source is not "
+                         "already a shared .bin: --subsample draws with numpy's "
+                         "Generator here and std::mt19937 there, and --blobs "
+                         "cannot be reproduced across the two at all.  "
+                         "run_one.sh does this for you.")
     ap.add_argument("--centroids", help="read initial centroids (k x d float32)")
     ap.add_argument("--dump-centroids",
                     help="write the initial centroids, for mpkmeans_bench "
@@ -255,10 +258,16 @@ def main():
         idx = np.sort(rng.choice(n, size=args.subsample, replace=False))
         X = np.ascontiguousarray(X[idx])
         n = X.shape[0]
-        if args.dump_subsample:
-            X.astype(np.float32).tofile(args.dump_subsample)
-            print(f"wrote {args.dump_subsample} ({n} x {X.shape[1]} float32) "
-                  f"-- give this to mpkmeans_bench --bin, not --subsample")
+
+    # Before --zscore, so the other side applies its own and lands in the same
+    # space; the centroids below are dumped after it, which is the frame
+    # mpkmeans_bench --init-centroids expects.
+    if args.dump_data:
+        X.astype(np.float32).tofile(args.dump_data)
+        with open(args.dump_data + ".meta", "w") as f:
+            f.write(f"{n} {X.shape[1]}\n")
+        print(f"wrote {args.dump_data} ({n} x {X.shape[1]} float32) "
+              f"and {os.path.basename(args.dump_data)}.meta")
 
     if args.zscore:
         X = zscore(X)
@@ -331,9 +340,11 @@ def main():
         print(f"    labels differing : {label_diff} of {n} "
               f"({100.0*label_diff/n:.3f}%)")
 
-    if truth is not None:
-        print(f"(synthetic: {args.k} planted clusters; blobs are "
-              f"distributionally matched to mpkMakeBlobs, not identical)")
+    if truth is not None and not args.dump_data:
+        print(f"(synthetic: {args.k} planted clusters.  These blobs match "
+              f"mpkMakeBlobs' construction but not its RNG, so they are NOT "
+              f"the points mpkmeans_bench would generate.  Use --dump-data, or "
+              f"run_one.sh, to give it these ones.)")
 
     # ---- CSV --------------------------------------------------------------
     if args.csv:

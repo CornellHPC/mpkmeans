@@ -428,7 +428,7 @@ if [[ -n "$SUBSAMPLED_SETS" ]]; then
     echo "  RNGs, so for these the rt-mp row clusters a DIFFERENT subset of the"
     echo "  same file than the other schemes do.  Sizes and distributions match;"
     echo "  the rows do not.  To make them identical, run the driver once with"
-    echo "  --dump-subsample and point both at that file with --bin."
+    echo "  --dump-data and point both at that file with --bin."
 fi
 if [[ $DRY -eq 0 ]]; then
     echo

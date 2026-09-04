@@ -64,7 +64,26 @@ One thing it still does not share with the C++ bench: its labels come from a
 re-assignment after the final update, so they sit half a Lloyd step ahead of
 ours — exactly as cuVS's do.
 
-To pin both sides to one set of initial centroids:
+### run_one.sh — one problem, both implementations, identical inputs
+
+```sh
+./run_one.sh --out /tmp/cmp --bin $DATA/data_yandex.bin -d 200 -k 64 \
+             --subsample 150000 --zscore --maxiters 400 --convergence
+```
+
+It runs the driver first so it can materialise the exact matrix it clusters
+(after `--subsample`, before `--zscore`) and the centroids it draws, then points
+`mpkmeans_bench` at both with `--bin` and `--init-centroids`. Neither side gets
+to draw its own, so the two cluster the same numbers from the same start — which
+is the only way `--blobs` can be compared at all, since no two RNGs reproduce
+each other's points.
+
+Common flags (`-k -n -d -s -b -e --maxiters --convergence --tol --zscore
+--subsample`) go to both; `--kappa` and `--kernel` go to the driver, and
+`--bench-extra` / `--rt-extra` pass anything else through verbatim. It prints a
+per-iteration comparison and leaves `bench.csv` and `rt.csv` in `--out`.
+
+To pin both sides to one set of initial centroids by hand:
 
 ```sh
 rt_baseline_mp.py ... --dump-centroids c0.bin
@@ -124,8 +143,9 @@ Two consequences worth knowing before reading any result:
   mnist8m (always) and arxiv (at k=1024) the `rt-mp` row clusters a different
   subset of the same file than the other schemes. Same size, same
   distribution, different rows. To make them identical, run the driver once
-  with `--dump-subsample` and point both sides at that file with `--bin`. The
-  generator prints which datasets this affects.
+  with `--dump-data` and point both sides at that file with `--bin`, which is
+  what `run_one.sh` does automatically. The generator prints which datasets
+  this affects.
 - **mnist8m is always subsampled**, to between 1.9M and 3.5M of its 8.1M rows
   depending on k. The subsample is recorded in the CSV's `n` column, so the
   plots show what was actually clustered.
