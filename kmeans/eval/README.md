@@ -64,6 +64,45 @@ One thing it still does not share with the C++ bench: its labels come from a
 re-assignment after the final update, so they sit half a Lloyd step ahead of
 ours — exactly as cuVS's do.
 
+### Why the rt-mp row is ~20x slower, and what it is not
+
+Measured on yandex 150000 x 200, k=64, 20 iterations (A100-SXM4):
+
+| | ms / iteration |
+| --- | --- |
+| `update_centers_fp32_with_reinit` | **11.25** |
+| `pairwise_euclidean_fp16_fp32` (kappa=5) | 4.49 |
+| `argmin(dim=1)` | 0.11 |
+| centroid-shift norm + `.item()` | 0.04 |
+| **total** | **15.9** |
+| *for scale:* their `pairwise_euclidean_single` | *0.51* |
+| *for scale:* a plain `X@C.T` fp16 GEMM, same shape | *0.079* |
+
+**It is not warm-up.** Repeated identical fits in one process: 569, 327, 328,
+327, 327, 327 ms. About 240 ms is one-off (context, kernel load, allocator
+reserving the n x k block) and the rest is steady state. `rt_baseline_mp.py`
+warms up at full size for that reason — a small slice warms the context but not
+the allocator.
+
+**It is not the Python loop.** The per-iteration `.item()` host sync costs
+0.035 ms, and `argmin` 0.11.
+
+**71% of it is the centroid update**, which has nothing to do with precision.
+It costs 7.5-7.8 ms per 100k rows, flat in k between 32 and 256, so it is
+linear in n and roughly an order of magnitude slower per row than our own
+M-step.
+
+**The rest is the fallback, not the FP16 GEMM.** Sweeping kappa at fixed data:
+0 -> 0.48 ms, 0.5 -> 0.50, **5 -> 4.43**, 50 -> 3.71, 1e6 -> 3.71. At kappa=0
+the mixed kernel matches their own fp32 (0.51); at the paper's kappa=5 it is 9x
+that. The reliability test's FP32 direct-formula fallback is the entire
+expense — the kernel costs 57x the FP16 GEMM it is built around. (kappa=5 being
+slower than kappa=50 is consistent with warp divergence: partial fallback is
+worse than total fallback.)
+
+This is the same shape of result as our own reimplementation of the method: it
+falls back on ~97% of entries, so it is nearly exact and pays accordingly.
+
 ### run_one.sh — one problem, both implementations, identical inputs
 
 ```sh

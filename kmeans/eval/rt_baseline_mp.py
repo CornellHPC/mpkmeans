@@ -300,10 +300,13 @@ def main():
     else:
         print(f"stopping : none -- exactly {args.maxiters} iterations")
 
-    # a first CUDA call pays for context setup and kernel load; keep that out
-    # of the timed fit
-    fit_once(X_t[: min(n, 4096)].contiguous(), C0_t, args.kernel, args.kappa,
-             2, args.tol, args.seed)
+    # A first fit pays for CUDA context setup, kernel load, and torch's
+    # caching allocator reserving the n x k distance block and the workspaces.
+    # Measured on 150k x 200, k=64: fit 0 takes 569 ms and fits 1-5 take 327,
+    # so ~240 ms of that is one-off.  The warm-up is therefore at FULL SIZE --
+    # a small slice warms the context but not the allocator, and leaves most of
+    # the one-off cost inside the timed run.
+    fit_once(X_t, C0_t, args.kernel, args.kappa, 2, 1e-45, args.seed)
 
     # mirror mpkmeans_bench: --convergence enables the Frobenius test, and
     # without it the fit runs the full --maxiters
