@@ -15,6 +15,63 @@ submits the subset whose job name contains `<pattern>`.
 
 ## What gets run
 
+## The rt baseline is the authors' own code
+
+`rt-base` in these runs is **not** our C++ reimplementation. Every bench
+invocation is issued with `--skip rt`, and the arXiv:2407.12208 baseline comes
+instead from `mp-kmeans` on PyPI — Carson, Chen and Liu's own package for that
+paper — driven by `rt_baseline_mp.py` with kernel `fp16_fp32`,
+`init_method='random'` (never k-means++) and `normalize=None`. Its rows carry
+`cond=rt-mp` and land in `results/<job>.rt.csv`.
+
+It is emitted once per (dataset, k) under the `--accum fp32` arm only: their
+kernel is `fp16_fp32` whatever our `--accum` says, so running it under both
+would just duplicate the row.
+
+**Environment.** The wheel ships prebuilt CUDA extensions for **cpython-3.12
+only**, with no torch pin, and on torch 2.14 every kernel fails
+`TORCH_CHECK(P.is_contiguous())` on tensors that are demonstrably contiguous —
+an ABI mismatch that presents as a bad argument. What works:
+
+```sh
+mamba create -p $SCRATCH/envs/mpk -c conda-forge python=3.12 pip
+$SCRATCH/envs/mpk/bin/pip install mp-kmeans
+$SCRATCH/envs/mpk/bin/pip install --index-url https://download.pytorch.org/whl/cu130 \
+    "torch==2.12.1+cu130"
+```
+
+`2_gen_jobs.sh` bakes `$SCRATCH/envs/mpk/bin/python` into the jobs; override
+with `RT_PYTHON=... ./2_gen_jobs.sh`. A missing interpreter makes the rt rows
+be skipped with a message, not the whole sweep fail.
+
+**Reading its numbers.** `rt-mp`'s `inertia_fp32`, `ms_total_fp32` and
+`iters_fp32` come from that package's *own* fp32 fit, not from `mpkMeansFP32`,
+so a "speedup vs fp32" built from them measures a different thing than every
+other row. The plotter therefore keeps `rt-mp` out of the ratio plots and shows
+it in the absolute `ms/iteration` plots, where no reference is implied. Its
+`hp_*` columns are not measured either: the reliability test and the fallback
+happen inside one CUDA call that reports neither count.
+
+Two further things it does not share with the C++ bench: it stops on
+`||C_new - C_old||_F < tol` rather than `max_j ||c_j - c_j_prev||_2 < tol`
+(Frobenius bounds the max, so at equal tol theirs is stricter), and its labels
+come from a re-assignment after the final update, so they sit half a Lloyd step
+ahead of ours — exactly as cuVS's do.
+
+To pin both sides to one set of initial centroids:
+
+```sh
+rt_baseline_mp.py ... --dump-centroids c0.bin
+mpkmeans_bench    ... --init-centroids c0.bin     # read in the unshifted frame
+```
+
+Without that the two draw their own seeded samples. `--bin` and `--libsvm`
+already read byte-identical data; `--blobs` mirrors `mpkMakeBlobs`'
+construction but not its RNG, so synthetic runs are distributionally matched,
+not identical.
+
+## What gets run
+
 Fixed for every invocation, per `instructions/eval.md`: `--maxiters 400
 --convergence`, both accumulators (`--accum fp32|fp16`), and both normalization
 states (with and without `--zscore`). Every invocation runs all eight schemes
@@ -79,6 +136,7 @@ script prints a loud warning for it.
 
     1_prep_datasets.sh   download + prepare (LIBSVM, and the SuperKMeans
                          corpora via ../scripts/fetch_superkmeans_datasets.sh)
+    rt_baseline_mp.py    the rt baseline, via the paper authors' own package
     2_gen_jobs.sh        write the jobscripts and run_all.sh
     3_plot.sh            venv bootstrap + plot_results.py
     plot_results.py      the plotting itself

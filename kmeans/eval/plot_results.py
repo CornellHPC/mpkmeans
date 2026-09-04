@@ -23,12 +23,22 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # the mixed-precision schemes, in the order they should appear in a legend
-CONDS = ["(3)", "(6)", "(3)+(6)", "(3)->(6)", "raw", "mw", "rt-base", "cuvs"]
+CONDS = ["(3)", "(6)", "(3)+(6)", "(3)->(6)", "raw", "mw", "rt-base", "cuvs",
+         "rt-mp"]
 COLORS = {
     "(3)": "#4c72b0", "(6)": "#dd8452", "(3)+(6)": "#55a868",
     "(3)->(6)": "#c44e52", "raw": "#8172b3", "mw": "#937860",
-    "rt-base": "#da8bc3", "cuvs": "#8c8c8c",
+    "rt-base": "#da8bc3", "cuvs": "#8c8c8c", "rt-mp": "#000000",
 }
+
+# rt-mp rows come from eval/rt_baseline_mp.py -- the arXiv:2407.12208 authors'
+# own package.  Its inertia_fp32/ms_total_fp32/iters_fp32 columns are that
+# package's OWN fp32 fit, not mpkMeansFP32, so a "speedup vs fp32" computed
+# from them measures something different from every other row and must not
+# share an axis with them.  It appears in the absolute-time plots instead,
+# where no reference is implied.
+WITHIN_PKG_REF = {"rt-mp"}
+RATIO_CONDS = [c for c in CONDS if c not in WITHIN_PKG_REF]
 NUM = {"n", "d", "k", "std", "box", "seed", "zscore", "iters", "eps",
        "hp_baseline", "hp_reference", "hp_update", "hp_total",
        "pct_eliminated", "pct_reference", "pct_update", "pct_cond3",
@@ -84,7 +94,7 @@ def save(fig, out, name):
 def line_panels(rows, out, xkey, fname, title, ykey, ylabel, logy=False,
                 hline=None, conds=None, base="ms_dist"):
     """One panel per (box, n); a line per scheme; x is d or k."""
-    conds = conds or [c for c in CONDS if c not in ("cuvs",)]
+    conds = conds or [c for c in RATIO_CONDS if c != "cuvs"]
     groups = sorted({(r["box"], r["n"]) for r in rows})
     if not groups:
         return None
@@ -126,7 +136,7 @@ def line_panels(rows, out, xkey, fname, title, ykey, ylabel, logy=False,
 
 def bars_by_dataset(rows, out, fname, title, valfn, ylabel, hline=None,
                     conds=None):
-    conds = conds or CONDS
+    conds = conds or RATIO_CONDS
     dsets = sorted({r["dataset"] for r in rows})
     if not dsets:
         return None
@@ -155,7 +165,7 @@ def bars_by_dataset(rows, out, fname, title, valfn, ylabel, hline=None,
 
 def paired_effect(rows, out, fname, title, key, on_label, off_label):
     """Median per-iteration speedup with the flag on vs off, per scheme."""
-    conds = [c for c in CONDS if c != "cuvs"]
+    conds = [c for c in RATIO_CONDS if c != "cuvs"]
     fig, ax = plt.subplots(figsize=(8, 4))
     width = 0.38
     xs = np.arange(len(conds))
@@ -255,6 +265,23 @@ def main():
                         lambda r: r["rel_inertia"], "|dSSE| / SSE_fp32")
     else:
         print("  (no real-dataset rows)")
+
+    # Absolute wall time per iteration is the one basis on which our schemes,
+    # cuVS and the authors' package can all be put side by side: it implies no
+    # reference and no shared convergence rule.
+    def ms_per_iter(r):
+        it = max(r.get("iters", 0) or 0, 1)
+        return r["ms_total"] / it
+
+    if real:
+        bars_by_dataset(real, args.out, "real_ms_per_iter.png",
+                        "wall time per iteration, whole fit "
+                        "(absolute; median over k)",
+                        ms_per_iter, "ms / iteration", conds=CONDS)
+    if synth:
+        line_panels(synth, args.out, "k", "ms_per_iter_vs_k_synth.png",
+                    "wall time per iteration, whole fit (absolute)",
+                    ms_per_iter, "ms / iteration", logy=True, conds=CONDS)
 
     print("\nflag effects:")
     paired_effect(rows, args.out, "accum_effect.png",

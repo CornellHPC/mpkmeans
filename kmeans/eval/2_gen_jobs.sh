@@ -121,14 +121,15 @@ NJOB=0; NRUN=0; NSKIP=0
 # ---------------------------------------------------------------- emit ----
 # Accumulates bench argument lines into CUR_RUNS, then writes one script.
 CUR_RUNS=()
+CUR_RT=()
 CUR_PEAK=0
 
 emit_job() {  # name family dataset box n sweeplabel accum zscore
     local name=$1 family=$2 dset=$3 box=$4 n=$5 slabel=$6 accum=$7 z=$8
-    [[ ${#CUR_RUNS[@]} -eq 0 ]] && return 0
+    [[ ${#CUR_RUNS[@]} -eq 0 ]] && { CUR_RT=(); return 0; }
     NJOB=$(( NJOB + 1 ))
     NRUN=$(( NRUN + ${#CUR_RUNS[@]} ))
-    if [[ $DRY -eq 1 ]]; then CUR_RUNS=(); CUR_PEAK=0; return 0; fi
+    if [[ $DRY -eq 1 ]]; then CUR_RUNS=(); CUR_RT=(); CUR_PEAK=0; return 0; fi
 
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$name" "$family" "$dset" "$box" "$n" "$slabel" "$accum" "$z" \
@@ -167,9 +168,14 @@ OUT=${RESULTS}/${name}.csv
 SRUN=\${MPK_SRUN-srun -n1 -G1}
 
 # mpkmeans_bench exits 2 when its own correctness check does not pass -- the
-# rows are still written, and on real data the `raw` config (no exclusion test,
+# rows are still written, and on real data the 'raw' config (no exclusion test,
 # no guarantee) trips it routinely by design.  That is a result, not a failure.
 # Anything else is a genuine failure and the job reports it.
+RT_PY=${RT_PY}
+RT_PYTHON=${RT_PYTHON}
+RT_OUT=${RESULTS}/${name}.rt.csv
+rm -f "\$RT_OUT"
+
 fail=0
 checks=0
 run() {
@@ -183,8 +189,27 @@ run() {
     esac
 }
 
+# The arXiv:2407.12208 baseline, from its authors' package.  A missing or
+# broken environment must not take the whole sweep down with it, so this is
+# reported and skipped rather than fatal -- see eval/README.md for the venv.
+rt_ok=1
+if [[ ! -x "\$RT_PYTHON" ]]; then
+    echo "rt baseline SKIPPED: no python at \$RT_PYTHON" >&2
+    rt_ok=0
+fi
+run_rt() {
+    [[ \$rt_ok -eq 1 ]] || return 0
+    echo "+ rt \$*" >&2
+    \$SRUN "\$RT_PYTHON" "\$RT_PY" --csv "\$RT_OUT" "\$@" \
+        || { echo "rt baseline FAILED: \$*" >&2; checks=\$(( checks + 1 )); }
+}
+
 HDR
         printf '%s\n' "${CUR_RUNS[@]}"
+        if [[ ${#CUR_RT[@]} -gt 0 ]]; then
+            printf '\n# --- rt baseline: mp-kmeans, kernel fp16_fp32 ---\n'
+            printf '%s\n' "${CUR_RT[@]}"
+        fi
         cat <<'FTR'
 
 if [[ $fail -ne 0 ]]; then
@@ -200,7 +225,7 @@ echo "ok"
 FTR
     } > "$JOBS/$name.sbatch"
     chmod +x "$JOBS/$name.sbatch"
-    CUR_RUNS=(); CUR_PEAK=0
+    CUR_RUNS=(); CUR_RT=(); CUR_PEAK=0
 }
 
 # Adds one invocation if it fits, else records why not.
@@ -240,9 +265,26 @@ add_run() {
 
     [[ $need -gt $CUR_PEAK ]] && CUR_PEAK=$need
     CUR_RUNS+=("run -k $k $extra")
+    # The same point through the authors' implementation.  --skip rt above
+    # removed our reimplementation; this puts the real one back.  Their kernel
+    # is fp16_fp32 whatever OUR --accum says, so it is emitted once, under the
+    # fp32 arm, rather than duplicated across both.
+    [[ "$extra" != *"--accum fp32"* ]] && return 0
+    local rt_extra="${extra//--convergence/}"
+    rt_extra="${rt_extra//--dataset /--libsvm }"
+    rt_extra="${rt_extra//--accum fp32/}"
+    rt_extra="${rt_extra//--accum fp16/}"
+    rt_extra="${rt_extra//--skip rt/}"
+    [[ "$family" == synth ]] && rt_extra="--blobs $rt_extra"
+    CUR_RT+=("run_rt -k $k $rt_extra")
 }
 
-COMMON="--maxiters 400 --convergence -e $SEED"
+# The arXiv:2407.12208 baseline comes from its authors' own package via
+# eval/rt_baseline_mp.py, not from our reimplementation of it, so the C++
+# rt-base config is skipped in every bench invocation.
+COMMON="--maxiters 400 --convergence -e $SEED --skip rt"
+RT_PY="${RT_PY:-$HERE/rt_baseline_mp.py}"
+RT_PYTHON="${RT_PYTHON:-/pscratch/sd/j/jbellav/envs/mpk/bin/python}"
 
 # ------------------------------------------------------------ synthetic ---
 if [[ -z "$ONLY_FAMILY" || "$ONLY_FAMILY" == synth ]]; then

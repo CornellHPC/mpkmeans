@@ -56,6 +56,12 @@ static void usage(const char* p) {
            "                 the benchmark holds P twice on the device (shifted\n"
            "                 and unshifted), so the ceiling is well under the\n"
            "                 card.  Ignored for blobs, where -n already says it\n"
+           "  --init-centroids <f>  start from the k x d float32 centroids in\n"
+           "                 this file instead of drawing them.  They are read\n"
+           "                 in the UNSHIFTED frame -- the one the data is in\n"
+           "                 before the (3)/(6) shift, and the one\n"
+           "                 eval/rt_baseline_mp.py --dump-centroids writes --\n"
+           "                 so both drivers can be pinned to one choice\n"
            "  --zscore       z-score normalize every feature of P before any\n"
            "                 scheme sees it, as arXiv:2407.12208 does (their\n"
            "                 Algorithm 5.1 line 1).  Off by default.  Changes\n"
@@ -83,6 +89,10 @@ static void usage(const char* p) {
            "                 means n -- one untiled pass, the shape our own\n"
            "                 schemes run in.  cuVS's own default is 32768;\n"
            "                 pass it to measure the library as it ships\n"
+           "  --skip <c>     drop one config by name; repeatable.  The eval\n"
+           "                 uses --skip rt, running the arXiv:2407.12208\n"
+           "                 baseline from its authors' own package instead\n"
+           "                 (eval/rt_baseline_mp.py)\n"
            "  --only <c>     run one config only: 3, 6, 36, c (cascade),\n"
            "                 rt (arXiv:2407.12208 baseline), raw (no exclusion\n"
            "                 test, no FP32 refinement -- the low precision\n"
@@ -183,6 +193,8 @@ int main(int argc, char** argv) {
     int   zscore = 0;               /* --zscore: standardize P up front */
     int   cuvs_batch = 0;           /* cuvs: 0 = n, one untiled pass    */
     const char* binset = nullptr;   /* --bin: raw float32 matrix        */
+    const char* initc = nullptr;    /* --init-centroids: shared dC0     */
+    int   skipped[MPK_NCFG] = {0};  /* --skip                           */
     long long subsample = 0;        /* --subsample: 0 = whole dataset   */
 
     for (int i = 1; i < argc; ++i) {
@@ -200,6 +212,16 @@ int main(int argc, char** argv) {
             max_iter = atoi(next());
         else if (!strcmp(a, "--dataset")) dataset = next();
         else if (!strcmp(a, "--bin")) binset = next();
+        else if (!strcmp(a, "--init-centroids")) initc = next();
+        else if (!strcmp(a, "--skip")) {
+            const char* v = next();
+            int c = !strcmp(v, "3") ? 0 : !strcmp(v, "6") ? 1 :
+                    !strcmp(v, "36") ? 2 : !strcmp(v, "c") ? 3 :
+                    !strcmp(v, "rt") ? 4 : !strcmp(v, "raw") ? 5 :
+                    !strcmp(v, "mw") ? 6 : !strcmp(v, "cuvs") ? 7 : -1;
+            if (c < 0) { usage(argv[0]); return 1; }
+            skipped[c] = 1;
+        }
         else if (!strcmp(a, "--subsample")) subsample = atoll(next());
         else if (!strcmp(a, "--convergence")) converge = 1;
         else if (!strcmp(a, "--zscore")) zscore = 1;
@@ -384,7 +406,30 @@ int main(int argc, char** argv) {
     if (!csv) printf("shift    : P += %.6g for (3)/(6); rt-base runs unshifted\n",
                      shift);
 
-    if (mpkInitRandomPoints(dP, n, d, k, (unsigned)seed, dC0) != MPK_OK) return 1;
+    /* dC0 lives in the SHIFTED frame, because that is where it is drawn from
+     * and what mpkMeansMixed/mpkMeansMultiword expect; the rt-base and cuvs
+     * drivers map it back with mpkShiftCentroids(-shift) below.  A file of
+     * centroids is written in the unshifted frame -- that is the frame the
+     * data itself is in before the shift, and the only one another
+     * implementation could have produced them in -- so it is moved forward by
+     * the same shift on the way in. */
+    if (initc) {
+        int cn = 0; float* hC = nullptr;
+        if (mpkLoadBin(initc, d, 0, &cn, &hC) != MPK_OK) return 1;
+        if (cn != k) {
+            fprintf(stderr, "%s: %d centroids of dimension %d, but k=%d\n",
+                    initc, cn, d, k);
+            return 1;
+        }
+        CHK(cudaMemcpy(dC0, hC, (size_t)k * d * sizeof(float),
+                       cudaMemcpyHostToDevice));
+        free(hC);
+        if (mpkShiftCentroids(dC0, k, d, shift) != MPK_OK) return 1;
+        if (!csv) printf("init     : %d centroids from %s (unshifted frame)\n",
+                         k, initc);
+    } else if (mpkInitRandomPoints(dP, n, d, k, (unsigned)seed, dC0) != MPK_OK) {
+        return 1;
+    }
 
     cublasHandle_t blas;   cublasCreate(&blas);
 
@@ -462,6 +507,7 @@ int main(int argc, char** argv) {
      * config is dropped from the tables and the CSV and the rest proceed. */
     std::vector<char> cfg_ran(MPK_NCFG, 1);
     auto skip = [&](int c) {
+        if (skipped[c]) return true;
         if (only >= 0 && only != c) return true;
         if (!cfg_ran[c]) return true;
         return kConfigs[c].driver == 3 && !mpkHaveCuvs();
