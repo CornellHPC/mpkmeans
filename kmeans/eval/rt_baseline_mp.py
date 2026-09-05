@@ -98,6 +98,53 @@ def load_bin(path, d):
     return np.fromfile(path, dtype=np.float32).reshape(-1, d)
 
 
+def resolve_bin_dim(path, explicit_dim):
+    """A --bin file's dimension is a property of the file, not something to
+    retype on the command line -- and a wrong guess does not fail, it just
+    reshapes the matrix into garbage as long as the byte count still divides.
+
+    Two sources know the real value without being asked: a --dump-data
+    sidecar (<path>.meta, written "n d") is exact; a manifest.tsv next to a
+    scripts/fetch_superkmeans_datasets.sh dataset (matched by the
+    data_<id>.bin filename) is authoritative for that id.  --dim is now only
+    a fallback for a file neither source recognises, and if it disagrees with
+    one that does, that is treated as a mistake (a flag copied from a
+    different invocation), not a request to override -- the file wins."""
+    found, src = None, None
+
+    meta_path = path + ".meta"
+    if os.path.exists(meta_path):
+        with open(meta_path) as f:
+            _n_meta, d_meta = (int(x) for x in f.read().split())
+        found, src = d_meta, meta_path
+
+    if found is None:
+        base = os.path.basename(path)
+        if base.startswith("data_") and base.endswith(".bin") \
+                and not base.endswith("_test.bin"):
+            dset_id = base[len("data_"):-len(".bin")]
+            man_path = os.path.join(os.path.dirname(path), os.pardir,
+                                     "manifest.tsv")
+            if os.path.exists(man_path):
+                with open(man_path, newline="") as f:
+                    for row in csv.DictReader(f, delimiter="\t"):
+                        if row.get("id") == dset_id:
+                            found, src = int(row["d"]), man_path
+                            break
+
+    if found is not None and explicit_dim is not None and explicit_dim != found:
+        sys.exit(f"{path}: --dim {explicit_dim} disagrees with {src} "
+                  f"(d={found}) -- fix whichever one is wrong, this refuses "
+                  f"to silently pick one")
+
+    if found is not None:
+        return found
+    if explicit_dim is not None:
+        return explicit_dim
+    sys.exit(f"{path}: cannot determine dimension -- no .meta sidecar, no "
+             f"manifest.tsv entry for it, and no --dim given")
+
+
 def load_libsvm(path):
     """Densify to the largest feature index, as mpkLoadLibsvm does."""
     rows, maxidx = 0, 0
@@ -249,13 +296,23 @@ def profile_fit(X_t, C0_t, kernel, kappa, iters, seed):
             "iters": it, "wall": wall}
 
 
-def inertia_fp64(X_t, centers_t, labels_t):
+def inertia_fp64(X_t, centers_t, labels_t, chunk=200_000):
     """Sum of squared distances to the assigned centre, in FP64 -- the same
-    quantity mpkLaunchInertia computes for every other scheme."""
-    import torch
-    X = X_t.double()
-    C = centers_t.double()[labels_t]
-    return float(((X - C) ** 2).sum().item())
+    quantity mpkLaunchInertia computes for every other scheme.
+
+    Chunked over rows: X_t.double() and centers_t.double()[labels_t] each
+    materialize a full n x d FP64 array, so at n=999000, d=1536 (openai) the
+    two together are ~24.6 GB on top of whatever the fit itself still holds --
+    measured to OOM a 40 GB card outright.  Chunking bounds the extra memory
+    by chunk x d instead of n x d, independent of dataset size."""
+    C64 = centers_t.double()
+    total = 0.0
+    n = X_t.shape[0]
+    for i in range(0, n, chunk):
+        Xc = X_t[i:i + chunk].double()
+        Cc = C64[labels_t[i:i + chunk]]
+        total += ((Xc - Cc) ** 2).sum().item()
+    return float(total)
 
 
 def main():
@@ -266,8 +323,10 @@ def main():
     src.add_argument("--bin", help="headerless row-major float32 matrix")
     src.add_argument("--libsvm", help="LIBSVM text file")
     src.add_argument("--blobs", action="store_true", help="synthetic gaussians")
-    ap.add_argument("-d", "--dim", type=int, default=64,
-                    help="dimension; required with --bin, features with --blobs")
+    ap.add_argument("-d", "--dim", type=int, default=None,
+                    help="--blobs: feature count (default 64).  --bin: only "
+                    "needed as a fallback -- a .meta sidecar or a "
+                    "manifest.tsv entry is read first, see resolve_bin_dim")
     ap.add_argument("-n", type=int, default=200000, help="--blobs only")
     ap.add_argument("-k", type=int, required=True, help="clusters")
     ap.add_argument("-s", "--std", type=float, default=1.0, help="--blobs only")
@@ -336,12 +395,13 @@ def main():
     # ---- data -------------------------------------------------------------
     truth = None
     if args.bin:
-        X = load_bin(args.bin, args.dim); name = os.path.basename(args.bin)
+        bin_dim = resolve_bin_dim(args.bin, args.dim)
+        X = load_bin(args.bin, bin_dim); name = os.path.basename(args.bin)
     elif args.libsvm:
         X = load_libsvm(args.libsvm); name = os.path.basename(args.libsvm)
     else:
-        X, truth = make_blobs(args.n, args.dim, args.k, args.std, args.box,
-                              args.seed)
+        X, truth = make_blobs(args.n, args.dim or 64, args.k, args.std,
+                              args.box, args.seed)
         name = "blobs"
     n, d = X.shape
 

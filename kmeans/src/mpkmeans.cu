@@ -113,8 +113,9 @@ extern "C" double mpkEpsilon(int d, int accum) {
     const double g = (double)d * u;
     if (g >= 1.0) return -1.0;
     const double gamma = g / (1.0 - g);
-    const double eps = (1.0 + U_FP16) * (1.0 + U_FP16) * (1.0 + gamma) - 1.0;
-    return (eps >= 1.0) ? -1.0 : eps;
+    //const double eps = (1.0 + U_FP16) * (1.0 + U_FP16) * (1.0 + gamma) - 1.0;
+    const double eps = 2 * U_FP16 + gamma;
+    return eps;
 }
 
 /* ------------------------------------------------------------ preprocess -- */
